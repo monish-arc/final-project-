@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 <div align="center">
 <img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
 </div>
@@ -50,3 +51,6 @@ python scripts/import_historical_data.py --dataset path/to/rainfall.csv --year 2
 Percentile baselines (P50/P90/P95, minimum 30 observations) drive severity ratios:
 `≥1.2 Elevated`, `≥1.5 High`, `≥2.0 Extreme` versus the previous-year average. Frontend
 surfaces: dashboard card, GIS overlay panel, and Data Source Status `Historical Rainfall` layer.
+=======
+# final-project-
+>>>>>>> 8e8016d4c7a4731ea0b38c471a31c5f79e05a489
