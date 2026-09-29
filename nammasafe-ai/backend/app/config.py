@@ -131,6 +131,9 @@ IMD_MAUSAM_TIMEOUT_SEC = float(os.getenv("IMD_MAUSAM_TIMEOUT_SEC", "12"))
 
 # -------------------- Terrain (NASA Earthdata SRTM primary / Open-Meteo fallback) --------------------
 TERRAIN_CACHE_TTL_SEC = int(os.getenv("TERRAIN_CACHE_TTL_SEC", "86400"))
+# Short TTL for cached *failure* payloads (UNAVAILABLE/NOT_CONFIGURED) so a
+# wounded provider recovers quickly instead of sticking for the success TTL.
+TERRAIN_FAILURE_CACHE_TTL_SEC = int(os.getenv("TERRAIN_FAILURE_CACHE_TTL_SEC", "30"))
 # Number of cardinal samples around the query point used for slope estimation.
 TERRAIN_GRID_SAMPLES = int(os.getenv("TERRAIN_GRID_SAMPLES", "8"))
 # Distance (km) from the query point to the sample ring used for slope
@@ -209,9 +212,11 @@ TERRAIN_GRID_TIMEOUT_SEC = float(os.getenv("TERRAIN_GRID_TIMEOUT_SEC", "45"))
 NASA_TERRAIN_SAMPLE_ARCSEC = int(os.getenv("NASA_TERRAIN_SAMPLE_ARCSEC", "3"))
 # Persist validated NASA SRTM samples to the terrain_samples cache table.
 TERRAIN_DB_CACHE = os.getenv("TERRAIN_DB_CACHE", "on")
-# Open-Meteo may be used as a fallback ONLY when this is explicitly "on".
-# Off by default: NASA failure is reported honestly as UNAVAILABLE.
-NASA_TERRAIN_FALLBACK_OPENMETEO = os.getenv("NASA_TERRAIN_FALLBACK_OPENMETEO", "off") == "on"
+# Open-Meteo elevation (SRTM/COP90-derived) may serve terrain as a fallback.
+# ON by default so a fresh deployment works with zero secrets; the real NASA
+# SRTM stays the provider of record whenever a token is configured. Operators
+# may disable it (NASA failures then report honestly as UNAVAILABLE/NOT_CONFIGURED).
+NASA_TERRAIN_FALLBACK_OPENMETEO = os.getenv("NASA_TERRAIN_FALLBACK_OPENMETEO", "on") == "on"
 
 # -------------------- Copernicus CDS / GloFAS --------------------
 # The CDS API is job-based, not a simple REST lookup. GloFAS point extraction

@@ -165,16 +165,17 @@ def test_fetch_point_month_top_rain_day_is_real_date(monkeypatch):
     """The wettest day's date must be the actual wettest day (mid-month here),
     not a hard-coded first-of-month."""
     monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
     base = _era5_daily_stub([30.42], [79.35], 2025, 6)
     precip = [5.0 if d == 17 else 0.0 for d in range(1, 31)]
     base["precipitation_sum"] = precip
     base["rain_sum"] = list(precip)
     monkeypatch.setattr(
-        historical_weather_mod.historical_weather,
+        provider,
         "_fetch_month_daily",
         lambda latitudes, longitudes, year, month: base,
     )
-    payload = historical_weather_mod.historical_weather.fetch_point_month(30.42, 79.35, 2025, 6)
+    payload = provider.fetch_point_month(30.42, 79.35, 2025, 6)
     assert payload["top_rain_day"]["mm"] == 5.0
     assert payload["top_rain_day"]["date"] == "2025-06-17"
 
@@ -182,16 +183,18 @@ def test_fetch_point_month_top_rain_day_is_real_date(monkeypatch):
 def test_fetch_point_month_dry_month_has_no_top_rain(monkeypatch):
     """A month with no rain has no wettest day (honest None, not 'day 1, 0 mm')."""
     monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
     base = _era5_daily_stub([30.42], [79.35], 2025, 6)
     base["precipitation_sum"] = [0.0] * 30
     base["rain_sum"] = [0.0] * 30
     monkeypatch.setattr(
-        historical_weather_mod.historical_weather,
+        provider,
         "_fetch_month_daily",
         lambda latitudes, longitudes, year, month: base,
     )
-    payload = historical_weather_mod.historical_weather.fetch_point_month(30.42, 79.35, 2025, 6)
+    payload = provider.fetch_point_month(30.42, 79.35, 2025, 6)
     assert payload["top_rain_day"] is None
+    assert payload["data_status"] == "HISTORICAL"
     assert payload["variables"]["precipitation"]["value"] == 0.0
 
 
@@ -748,8 +751,9 @@ def test_archive_multi_location_list_payload_flattened_in_cell_order(monkeypatch
         return _FakeArchiveResponse(_archive_list_body(res_lats, res_lngs, 2025, 6))
 
     monkeypatch.setattr(hw, "http_get", listy_http_get)
+    provider = hw.HistoricalWeatherProvider(db_cache=False)
 
-    flattened = hw.historical_weather._fetch_month_daily(lats, lngs, 2025, 6)
+    flattened = provider._fetch_month_daily(lats, lngs, 2025, 6)
     days = monthrange(2025, 6)[1]
     assert len(flattened["time"]) == len(lats) * days
     # Cell order preserved: cell i occupies arrays[i*days:(i+1)*days].
@@ -757,7 +761,7 @@ def test_archive_multi_location_list_payload_flattened_in_cell_order(monkeypatch
     assert flattened["temperature_2m_mean"][days] == 18.0 + 1 + (1 % 5)          # cell 1, day 1
     assert flattened["temperature_2m_mean"][2 * days] == 18.0 + 2 + (1 % 5)      # cell 2, day 1
 
-    point = hw.historical_weather.fetch_point_month(30.42, 79.35, 2025, 6)
+    point = provider.fetch_point_month(30.42, 79.35, 2025, 6)
     assert point["data_status"] == "HISTORICAL"
     assert point["variables"]["temperature_2m"]["value"] == pytest.approx(20.0)
 
@@ -770,7 +774,8 @@ def test_archive_dict_payload_still_accepted(monkeypatch):
         return _FakeArchiveResponse({"daily": _era5_daily_stub([30.42], [79.35], 2025, 6)})
 
     monkeypatch.setattr(hw, "http_get", dicty_http_get)
-    flattened = hw.historical_weather._fetch_month_daily([30.42], [79.35], 2025, 6)
+    provider = hw.HistoricalWeatherProvider(db_cache=False)
+    flattened = provider._fetch_month_daily([30.42], [79.35], 2025, 6)
     assert len(flattened["time"]) == monthrange(2025, 6)[1]
     assert flattened["temperature_2m_mean"][0] == 18.0 + (1 % 5)
 
@@ -788,6 +793,7 @@ def test_archive_genuinely_bad_shape_is_honest_unavailable(monkeypatch):
         [{"latitude": 30.42, "daily": None}],  # record missing the daily block
     ]
 
+    provider = hw.HistoricalWeatherProvider(db_cache=False)
     for body in bad_bodies:
         class _BadBodyResponse:
             status_code = 200
@@ -800,9 +806,9 @@ def test_archive_genuinely_bad_shape_is_honest_unavailable(monkeypatch):
         monkeypatch.setattr(hw, "http_get", lambda *a, **k: _BadBodyResponse())
 
         with pytest.raises(HttpFetchError):
-            hw.historical_weather._fetch_month_daily([30.42], [79.35], 2025, 6)
+            provider._fetch_month_daily([30.42], [79.35], 2025, 6)
 
-        point = hw.historical_weather.fetch_point_month(30.42, 79.35, 2025, 6)
+        point = provider.fetch_point_month(30.42, 79.35, 2025, 6)
         assert point["data_status"] == "UNAVAILABLE"
         assert "unavailable" in point["reason"].lower()
 
@@ -862,3 +868,230 @@ def test_data_catalog_surface(db_ctx, auth_headers, officer_headers):
         assert "historical_weather" in keys
         assert "weather_forecast" in keys and "srtm_elevation" in keys
         assert body["live_weather_enabled"] in (True, False)
+
+
+# ---------------- archive resilience (block cache, single-flight, 429) ----------------
+
+class FakeJsonResponse:
+    def __init__(self, status_code=200, payload=None, headers=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+@pytest.fixture(autouse=True)
+def _isolate_shared_guards(monkeypatch):
+    """Reset the cross-provider inflight + cooldown guards for every test so
+    one test can never leak a cooldown or a half-finished single-flight slot."""
+    monkeypatch.setattr("app.weather_service._INFLIGHT", {})
+    monkeypatch.setattr("app.weather_service._PROVIDER_COOLDOWN_UNTIL", {})
+
+
+def _archive_daily_body(params):
+    lats = [float(x) for x in str(params["latitude"]).split(",")]
+    lngs = [float(x) for x in str(params["longitude"]).split(",")]
+    return {"daily": _era5_daily_stub(lats, lngs, 2025, 6)}
+
+
+def test_archive_block_cache_serves_repeat_without_upstream(monkeypatch):
+    """Repeating the same archive window + cells is served from the block cache:
+    exactly ONE upstream request total."""
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+    calls = {"n": 0}
+
+    def intercept(url, params=None, timeout=None):
+        calls["n"] += 1
+        return FakeJsonResponse(200, _archive_daily_body(params))
+
+    monkeypatch.setattr(historical_weather_mod, "http_get", intercept)
+    first = provider._fetch_month_daily([30.42], [79.35], 2025, 6)
+    second = provider._fetch_month_daily([30.42], [79.35], 2025, 6)
+    assert calls["n"] == 1
+    assert first == second
+
+
+def test_archive_block_single_flight_dedups_concurrent(monkeypatch):
+    """Six concurrent callers of the same archive window collapse into ONE
+    upstream request; every waiter gets the same daily payload."""
+    import threading
+    import time
+
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+    calls = {"n": 0}
+
+    def intercept(url, params=None, timeout=None):
+        calls["n"] += 1
+        time.sleep(0.1)
+        return FakeJsonResponse(200, _archive_daily_body(params))
+
+    monkeypatch.setattr(historical_weather_mod, "http_get", intercept)
+    barrier = threading.Barrier(6)
+    results, errors = [], []
+
+    def worker():
+        barrier.wait()
+        try:
+            results.append(provider._fetch_month_daily([30.42], [79.35], 2025, 6))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    assert len(results) == 6
+    assert calls["n"] == 1
+
+
+def test_archive_429_retries_then_succeeds(monkeypatch):
+    """A 429 is retried once with a bounded backoff; the request succeeds."""
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    monkeypatch.setattr(historical_weather_mod.time, "sleep", lambda _: None)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+    calls = {"n": 0}
+
+    def throttled_then_ok(url, params=None, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return FakeJsonResponse(429, None, headers={"retry-after": "2"})
+        return FakeJsonResponse(200, _archive_daily_body(params))
+
+    monkeypatch.setattr(historical_weather_mod, "http_get", throttled_then_ok)
+    daily = provider._fetch_month_daily([30.42], [79.35], 2025, 6)
+    assert calls["n"] == 2
+    assert len(daily["time"]) == 30
+
+
+def test_archive_429_long_retry_after_gives_up(monkeypatch):
+    """An explicit long Retry-After is honored: give up immediately instead of
+    sleeping past our own bounded backoff window."""
+    from app.http_client import HttpFetchError
+
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+    calls = {"n": 0}
+
+    def throttled(url, params=None, timeout=None):
+        calls["n"] += 1
+        return FakeJsonResponse(429, None, headers={"retry-after": "45"})
+
+    monkeypatch.setattr(historical_weather_mod, "http_get", throttled)
+    with pytest.raises(HttpFetchError):
+        provider._fetch_month_daily([30.42], [79.35], 2025, 6)
+    assert calls["n"] == 1
+
+
+def test_point_month_cache_serves_repeat_without_refetch(monkeypatch):
+    """Repeated point-month reads for the same cell + month skip the archive."""
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+    calls = {"n": 0}
+
+    def counting(latitudes, longitudes, year, month):
+        calls["n"] += 1
+        return _era5_daily_stub(latitudes, longitudes, year, month)
+
+    monkeypatch.setattr(provider, "_fetch_month_daily", counting)
+    first = provider.fetch_point_month(30.42, 79.35, 2025, 6)
+    second = provider.fetch_point_month(30.42, 79.35, 2025, 6)
+    assert first["data_status"] == "HISTORICAL"
+    assert second["data_status"] == "HISTORICAL"
+    assert calls["n"] == 1
+
+
+def test_fetch_grid_all_chunks_fail_is_unavailable(monkeypatch):
+    """A monthly grid whose every upstream request fails is UNAVAILABLE — it
+    must NOT be masked as a successful HISTORICAL grid."""
+    from app.http_client import HttpFetchError
+
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+
+    def boom(latitudes, longitudes, year, month):
+        raise HttpFetchError("upstream exploded")
+
+    monkeypatch.setattr(provider, "_fetch_month_daily", boom)
+    grid = provider.fetch_grid(
+        north=30.6, south=30.0, east=80.0, west=78.0,
+        step=0.5, max_points=600,
+        variable="precipitation", year=2025, month=6,
+    )
+    assert grid["data_status"] == "UNAVAILABLE"
+    assert grid["reason"]
+    assert grid["min"] is None and grid["max"] is None
+    assert all(p["data_status"] == "UNAVAILABLE" for p in grid["points"])
+    assert all(p["value"] is None for p in grid["points"])
+
+
+def test_fetch_grid_day_all_fail_is_unavailable(monkeypatch):
+    """Same honesty for a per-day grid: zero real values => UNAVAILABLE."""
+    from app.http_client import HttpFetchError
+
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+
+    def boom(latitudes, longitudes, year, month, day):
+        raise HttpFetchError("upstream exploded")
+
+    monkeypatch.setattr(provider, "_fetch_day_daily", boom)
+    grid = provider.fetch_grid(
+        north=30.6, south=30.0, east=80.0, west=78.0,
+        step=0.5, max_points=600,
+        variable="precipitation", year=2025, month=6, day=13,
+    )
+    assert grid["data_status"] == "UNAVAILABLE"
+    assert grid["min"] is None and grid["max"] is None
+    assert all(p["data_status"] == "UNAVAILABLE" for p in grid["points"])
+
+
+def test_fetch_grid_partial_failure_is_historical_with_unavailable_cells(monkeypatch):
+    """When SOME chunks succeed, the grid stays HISTORICAL but the failed cells
+    are honestly marked UNAVAILABLE and listed in the reason."""
+    from app.http_client import HttpFetchError
+
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+    calls = {"n": 0}
+
+    def flaky(latitudes, longitudes, year, month):
+        calls["n"] += 1
+        if calls["n"] in (2, 3):
+            raise HttpFetchError("chunk exploded")
+        return _era5_daily_stub(latitudes, longitudes, year, month)
+
+    monkeypatch.setattr(provider, "_fetch_month_daily", flaky)
+    grid = provider.fetch_grid(
+        north=30.6, south=30.0, east=80.0, west=78.0,
+        step=0.05, max_points=600,
+        variable="precipitation", year=2025, month=6,
+    )
+    assert grid["data_status"] == "HISTORICAL"
+    assert "Some cells unavailable" in grid["reason"]
+    statuses = {p["data_status"] for p in grid["points"]}
+    assert "HISTORICAL" in statuses and "UNAVAILABLE" in statuses
+    assert grid["min"] is not None
+
+
+def test_point_month_throttled_is_honest_unavailable(monkeypatch):
+    """While the archive provider is in 429 cooldown, the point read answers
+    UNAVAILABLE with a reason and does NOT touch the network."""
+    from app.weather_service import _mark_provider_cooldown
+
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+    _mark_provider_cooldown(HISTORICAL_PROVIDER_NAME, 60.0)
+
+    def no_network(url, params=None, timeout=None):
+        raise AssertionError("must not hit the network while in cooldown")
+
+    monkeypatch.setattr(historical_weather_mod, "http_get", no_network)
+    payload = provider.fetch_point_month(30.42, 79.35, 2025, 6)
+    assert payload["data_status"] == "UNAVAILABLE"
+    assert payload["reason"]

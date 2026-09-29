@@ -57,8 +57,12 @@ from app.http_client import HttpFetchError, http_get
 # ---------------------------------------------------------------------------
 from app.weather_service import (  # noqa: E402
     _PROVIDER_HTTP_SEMAPHORE,
+    _inflight_acquire,
+    _inflight_done,
+    _inflight_wait,
     _mark_provider_cooldown,
     _provider_in_cooldown,
+    _retry_after_seconds,
 )
 
 HISTORICAL_PROVIDER_NAME = "Open-Meteo ERA5 Archive"
@@ -267,6 +271,14 @@ class HistoricalWeatherProvider:
             config.HISTORICAL_WEATHER_CACHE_TTL_SEC,
             max_entries=16384,
         )
+        self._block_cache = TTLCache(
+            config.HISTORICAL_WEATHER_CACHE_TTL_SEC,
+            max_entries=256,
+        )
+        self._point_cache = TTLCache(
+            config.HISTORICAL_WEATHER_CACHE_TTL_SEC,
+            max_entries=4096,
+        )
         self._lock = threading.Lock()
 
     # ----------------------------- period bounds -----------------------------
@@ -285,6 +297,12 @@ class HistoricalWeatherProvider:
 
     # ------------------------------- network ---------------------------------
 
+    @staticmethod
+    def _archive_cache_key(latitudes: List[float], longitudes: List[float], start: str, end: str) -> str:
+        lat_key = ",".join(str(_round6(lat)) for lat in latitudes)
+        lng_key = ",".join(str(_round6(lng)) for lng in longitudes)
+        return f"archive:{start}:{end}:{lat_key}|{lng_key}"
+
     def _fetch_archive_block(
         self,
         latitudes: List[float],
@@ -296,9 +314,53 @@ class HistoricalWeatherProvider:
     ) -> Dict[str, Any]:
         """One multi-location archive request for an arbitrary start..end window.
 
+        Served from a bounded in-memory cache (TTL = the standard historical
+        cache TTL) with a single-flight dedupe: concurrent callers for the same
+        window + cells collapse into ONE upstream request, and every waiter
+        gets the leader's daily block (or re-raises the leader's error).
+
         Returns a dict of raw column arrays flattened per location (arrays of
         length len(latitudes) * days); empty dict when the upstream cannot
         serve this request."""
+        cache_key = self._archive_cache_key(latitudes, longitudes, start, end)
+        cached = self._block_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        inflight_key = f"historical:archive:{cache_key}"
+        slot, is_leader = _inflight_acquire(inflight_key)
+        if not is_leader:
+            value = _inflight_wait(slot)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        try:
+            value = self._fetch_archive_block_uncached(
+                latitudes, longitudes, year, month, start, end
+            )
+        except BaseException as exc:
+            _inflight_done(inflight_key, slot, exc)
+            raise
+        _inflight_done(inflight_key, slot, value)
+        self._block_cache.set(cache_key, value, config.HISTORICAL_WEATHER_CACHE_TTL_SEC)
+        return value
+
+    def _fetch_archive_block_uncached(
+        self,
+        latitudes: List[float],
+        longitudes: List[float],
+        year: int,
+        month: int,
+        start: str,
+        end: str,
+    ) -> Dict[str, Any]:
+        """Raw archive transport for one window: bounded 429 backoff + parse.
+
+        On a 429 the provider cooldown is marked with an honoured Retry-After;
+        a short backoff is attempted up to 3 requests, and an explicit long
+        Retry-After gives up immediately instead of sleeping past our window.
+        """
         provider = HISTORICAL_PROVIDER_NAME
         if _provider_in_cooldown(provider):
             raise HttpFetchError(f"{provider} throttled (429 cooldown active)")
@@ -313,22 +375,40 @@ class HistoricalWeatherProvider:
             "timezone": "GMT",
         }
         url = f"{config.HISTORICAL_WEATHER_BASE_URL}/archive"
-        try:
-            with _PROVIDER_HTTP_SEMAPHORE:
-                response = http_get(
-                    url,
-                    params=params,
-                    timeout=config.HISTORICAL_WEATHER_TIMEOUT_SEC,
-                )
-        except HttpFetchError as exc:
-            raise
-        if response.status_code == 429:
-            retry_after = response.headers.get("retry-after") or response.headers.get("Retry-After")
-            _mark_provider_cooldown(
-                provider,
-                min(60.0, max(1.0, float(retry_after))) if retry_after else config.HISTORICAL_WEATHER_COOLDOWN_SEC,
-            )
-            raise HttpFetchError(f"{provider} rate limited (429)")
+        delayed_seconds = (2.0, 4.0)
+        response = None
+        for attempt in range(3):
+            try:
+                with _PROVIDER_HTTP_SEMAPHORE:
+                    response = http_get(
+                        url,
+                        params=params,
+                        timeout=config.HISTORICAL_WEATHER_TIMEOUT_SEC,
+                    )
+            except HttpFetchError as exc:
+                raise
+            if response.status_code != 429:
+                break
+            headers = getattr(response, "headers", None) or {}
+            retry_after = _retry_after_seconds(headers, config.HISTORICAL_WEATHER_COOLDOWN_SEC)
+            _mark_provider_cooldown(provider, retry_after)
+            if attempt >= 2:
+                raise HttpFetchError(f"{provider} rate limited (429)")
+            delay = delayed_seconds[min(attempt, 1)]
+            raw = headers.get("retry-after") or headers.get("Retry-After")
+            if raw:
+                try:
+                    wait_sec = float(str(raw).strip())
+                except (TypeError, ValueError):
+                    wait_sec = float(retry_after)
+                if wait_sec > delay + 1.0:
+                    raise HttpFetchError(
+                        f"{provider} rate limited (429, Retry-After {raw}s)"
+                    )
+                delay = min(delay, wait_sec)
+            time.sleep(delay)
+        if response is None:  # pragma: no cover - defensive
+            raise HttpFetchError(f"{provider} did not answer for {start}..{end}")
         if response.status_code >= 400:
             raise HttpFetchError(f"{provider} rejected request ({response.status_code}) for {start}..{end}")
         try:
@@ -683,6 +763,11 @@ class HistoricalWeatherProvider:
                 "reason": reason,
             }
 
+        point_key = f"point:{lat}:{lng}:{int(year)}:{int(month)}"
+        cached_point = self._point_cache.get(point_key)
+        if cached_point is not None:
+            return cached_point
+
         try:
             daily = self._fetch_month_daily([lat], [lng], int(year), int(month))
         except HttpFetchError as exc:
@@ -767,7 +852,7 @@ class HistoricalWeatherProvider:
             if top_v is not None and top_v > 0 and top_idx is not None and top_idx < len(cell_dates):
                 top_rain = {"date": cell_dates[top_idx], "mm": top_val.get("value")}
 
-        return {
+        payload = {
             "latitude": lat,
             "longitude": lng,
             "data_status": "HISTORICAL",
@@ -785,6 +870,8 @@ class HistoricalWeatherProvider:
             "computed_at": now,
             "reason": None,
         }
+        self._point_cache.set(point_key, payload, config.HISTORICAL_WEATHER_CACHE_TTL_SEC)
+        return payload
 
     # -------------------------------- grid ----------------------------------
 
@@ -1007,8 +1094,18 @@ class HistoricalWeatherProvider:
         payload["max"] = round(max(values), 5) if values else None
         payload["points"] = points
         payload["valid_time"] = f"{int(year)}-{int(month):02d}"
-        payload["data_status"] = "HISTORICAL"
-        payload["reason"] = None if not failures else "Some cells unavailable: " + "; ".join(failures) + "."
+        if values:
+            payload["data_status"] = "HISTORICAL"
+            payload["reason"] = (
+                None if not failures else "Some cells unavailable: " + "; ".join(failures) + "."
+            )
+        else:
+            payload["data_status"] = "UNAVAILABLE"
+            payload["reason"] = (
+                "All archive requests failed for this grid: " + "; ".join(failures) + "."
+                if failures
+                else "Archive returned no values for any cell in this grid."
+            )
         payload["assumption"] = f"ERA5 daily {col} aggregated as {aggregation}."
         payload["generated_at"] = now
         payload["data_provenance"] = {
@@ -1108,8 +1205,18 @@ class HistoricalWeatherProvider:
         payload["min"] = round(min(values), 5) if values else None
         payload["max"] = round(max(values), 5) if values else None
         payload["points"] = points
-        payload["data_status"] = "HISTORICAL"
-        payload["reason"] = None if not failures else "Some cells unavailable: " + "; ".join(failures) + "."
+        if values:
+            payload["data_status"] = "HISTORICAL"
+            payload["reason"] = (
+                None if not failures else "Some cells unavailable: " + "; ".join(failures) + "."
+            )
+        else:
+            payload["data_status"] = "UNAVAILABLE"
+            payload["reason"] = (
+                "All archive requests failed for this grid: " + "; ".join(failures) + "."
+                if failures
+                else "Archive returned no values for any cell in this grid."
+            )
         payload["assumption"] = f"ERA5 daily {variable} for {int(year)}-{int(month):02d}-{int(day):02d}."
         payload["generated_at"] = now
         payload["data_provenance"] = {

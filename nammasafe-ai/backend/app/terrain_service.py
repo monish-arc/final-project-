@@ -5,10 +5,10 @@ Elevation comes from the actual 1-arc-second DEM (bilinear), and slope is the
 real gradient of a DEM window around the point (Horn's method) -- never a
 fabricated value.
 
-Open-Meteo's elevation endpoint (SRTM/COP90-derived) may act as a fallback
-provider ONLY when config.NASA_TERRAIN_FALLBACK_OPENMETEO=on is explicitly
-set; such payloads are always labelled "fallback" and never pretend to be NASA
-data.
+Open-Meteo's elevation endpoint (SRTM/COP90-derived) acts as a fallback
+provider via config.NASA_TERRAIN_FALLBACK_OPENMETEO. The fallback is ON by
+default so a fresh deployment serves elevation with no secrets; such payloads
+are always labelled "fallback" and never pretend to be NASA data.
 
 Data-status contract (mirrors weather_service):
   LIVE         -> elevations fetched from the serving provider
@@ -32,6 +32,17 @@ from app.nasa_elevation_client import (
     NasaSrtmElevationClient,
     NasaTileMissingError,
 )
+from app.weather_service import (
+    _inflight_acquire,
+    _inflight_done,
+    _inflight_wait,
+    _mark_provider_cooldown,
+    _PROVIDER_HTTP_SEMAPHORE,
+    _provider_in_cooldown,
+    _retry_after_seconds,
+)
+
+_OPENMETEO_ELEVATION_PROVIDER = "Open-Meteo elevation"
 
 # Fraction of stair-step count by steepness (typical building-regulation style bands).
 _SLOPE_BANDS: List[tuple] = [
@@ -103,13 +114,25 @@ class TerrainService:
     def _fetch_elevation(self, points: List[tuple]) -> List[Optional[float]]:
         if not points:
             return []
+        if _provider_in_cooldown(_OPENMETEO_ELEVATION_PROVIDER):
+            raise HttpFetchError(
+                "Open-Meteo elevation provider is in its rate-limit cooldown window"
+            )
         lats = ",".join(f"{p[0]:.6f}" for p in points)
         lngs = ",".join(f"{p[1]:.6f}" for p in points)
-        response = http_get(
-            f"{self._base_url}/elevation",
-            params={"latitude": lats, "longitude": lngs},
-            timeout=config.WEATHER_TIMEOUT_SEC,
-        )
+        with _PROVIDER_HTTP_SEMAPHORE:
+            response = http_get(
+                f"{self._base_url}/elevation",
+                params={"latitude": lats, "longitude": lngs},
+                timeout=config.WEATHER_TIMEOUT_SEC,
+            )
+        if response.status_code == 429:
+            retry_after = _retry_after_seconds(
+                getattr(response, "headers", None) or {},
+                config.WEATHER_PROVIDER_COOLDOWN_SEC,
+            )
+            _mark_provider_cooldown(_OPENMETEO_ELEVATION_PROVIDER, retry_after)
+            raise HttpFetchError("Open-Meteo elevation throttled the request (HTTP 429)")
         if response.status_code >= 400:
             raise HttpFetchError(f"Open-Meteo elevation rejected ({response.status_code})")
         body = response.json()
@@ -281,26 +304,87 @@ class TerrainService:
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
-        if self._openmeteo_only or not self._nasa.configured():
-            payload = self._unavailable(
+
+        flight_key = f"elevfast:inflight:{cache_key}"
+        slot, is_leader = _inflight_acquire(flight_key)
+        if not is_leader:
+            value = _inflight_wait(slot)
+            if isinstance(value, dict):
+                return value
+            raise HttpFetchError("terrain single-flight leader produced no elevation payload")
+
+        payload: Optional[Dict[str, Any]] = None
+        try:
+            payload = self._elevation_fast_compute(latitude, longitude)
+            slim = dict(payload)
+            if payload.get("data_status") not in ("UNAVAILABLE", "NOT_CONFIGURED"):
+                note = "Elevation sample (fast path); slope/drainage available via /api/terrain."
+                provider_reason = payload.get("reason")
+                slim.update(
+                    {
+                        "slope_degrees": None,
+                        "slope_percent": None,
+                        "slope_category": None,
+                        "elevation_change_m": None,
+                        "reason": f"{provider_reason} {note}".strip() if provider_reason else note,
+                    }
+                )
+            ttl = (
+                config.TERRAIN_FAILURE_CACHE_TTL_SEC
+                if slim.get("data_status") in ("UNAVAILABLE", "NOT_CONFIGURED")
+                else None
+            )
+            self._cache.set(cache_key, slim, ttl_seconds=ttl)
+            return slim
+        finally:
+            _inflight_done(flight_key, slot, payload)
+
+    def _elevation_fast_compute(self, latitude: float, longitude: float) -> Dict[str, Any]:
+        """Elevation-only route for the fast path (cache/single-flight handled by
+        the caller). Falls back to the configured Open-Meteo elevation provider
+        when NASA Earthdata is not configured rather than failing the shim."""
+        if self._openmeteo_only:
+            return self._proxy_openmeteo(latitude, longitude, fallback=False)
+        if not self._nasa.configured():
+            if config.NASA_TERRAIN_FALLBACK_OPENMETEO:
+                try:
+                    return self._proxy_openmeteo(
+                        latitude, longitude, fallback=True,
+                        fallback_reason=(
+                            "NASA Earthdata token not configured; serving configured "
+                            "Open-Meteo elevation fallback."
+                        ),
+                    )
+                except HttpFetchError as exc:
+                    return self._elevation_unavailable(
+                        latitude, longitude,
+                        f"NASA Earthdata token not configured and Open-Meteo elevation fallback failed ({exc}).",
+                    )
+            return self._unavailable(
                 latitude, longitude, "NOT_CONFIGURED",
                 "NASA Earthdata token not configured; elevation fast path needs SRTM.",
             )
-        else:
-            payload = self.get_terrain(latitude, longitude)
-        slim = dict(payload)
-        if payload.get("data_status") not in ("UNAVAILABLE", "NOT_CONFIGURED"):
-            slim.update(
-                {
-                    "slope_degrees": None,
-                    "slope_percent": None,
-                    "slope_category": None,
-                    "elevation_change_m": None,
-                    "reason": "Elevation sample (fast path); slope/drainage available via /api/terrain.",
-                }
-            )
-        self._cache.set(cache_key, slim)
-        return slim
+        return self.get_terrain(latitude, longitude)
+
+    def _elevation_unavailable(self, latitude: float, longitude: float, reason: str) -> Dict[str, Any]:
+        return {
+            "latitude": round(latitude, 6),
+            "longitude": round(longitude, 6),
+            "data_status": "UNAVAILABLE",
+            "data_source": "Open-Meteo elevation (SRTM-derived)",
+            "provider": "open-meteo",
+            "provider_role": "fallback",
+            "dataset": "Open-Meteo elevation (SRTM/COP90)",
+            "elevation_m": None,
+            "slope_percent": None,
+            "slope_degrees": None,
+            "slope_category": None,
+            "elevation_change_m": None,
+            "sample_radius_km": config.TERRAIN_SAMPLE_KM,
+            "sample_count": 0,
+            "computed_at": _utc_now(),
+            "reason": reason,
+        }
 
     def get_terrain(self, latitude: float, longitude: float) -> Dict[str, Any]:
         cache_key = f"terrain:{round(latitude, 4)}:{round(longitude, 4)}"
@@ -308,22 +392,44 @@ class TerrainService:
         if cached is not None:
             return cached
 
-        if self._openmeteo_only:
-            payload = self._proxy_openmeteo(latitude, longitude, fallback=False)
-            self._cache.set(cache_key, payload)
+        flight_key = f"terrain:full:{cache_key}"
+        slot, is_leader = _inflight_acquire(flight_key)
+        if not is_leader:
+            value = _inflight_wait(slot)
+            if isinstance(value, dict):
+                return value
+            raise HttpFetchError("terrain single-flight leader produced no payload")
+
+        payload: Optional[Dict[str, Any]] = None
+        try:
+            payload = self._compute_terrain(latitude, longitude)
+            ttl = (
+                config.TERRAIN_FAILURE_CACHE_TTL_SEC
+                if payload.get("data_status") in ("UNAVAILABLE", "NOT_CONFIGURED")
+                else None
+            )
+            self._cache.set(cache_key, payload, ttl_seconds=ttl)
             return payload
+        finally:
+            _inflight_done(flight_key, slot, payload)
+
+    def _compute_terrain(self, latitude: float, longitude: float) -> Dict[str, Any]:
+        """No-cache/no-flight body for get_terrain. The DB cache is consulted
+        BEFORE the NASA token gate so a previously validated SRTM sample keeps
+        serving elevation even if the operator later removes the token."""
+        if self._openmeteo_only:
+            return self._proxy_openmeteo(latitude, longitude, fallback=False)
 
         fallback = config.NASA_TERRAIN_FALLBACK_OPENMETEO
 
+        db_hit = self._db_get(latitude, longitude)
+        if db_hit is not None:
+            return db_hit
+
         if self._nasa.configured():
-            db_hit = self._db_get(latitude, longitude)
-            if db_hit is not None:
-                self._cache.set(cache_key, db_hit)
-                return db_hit
             try:
                 payload = self._nasa_payload(latitude, longitude)
                 self._db_set(payload)
-                self._cache.set(cache_key, payload)
                 return payload
             except NasaAuthError:
                 base_reason = (
@@ -343,7 +449,7 @@ class TerrainService:
                 )
             if fallback:
                 try:
-                    payload = self._proxy_openmeteo(
+                    return self._proxy_openmeteo(
                         latitude, longitude, fallback=True,
                         fallback_reason=(
                             "NASA SRTM unavailable; serving configured Open-Meteo fallback: "
@@ -351,10 +457,7 @@ class TerrainService:
                         ),
                     )
                 except HttpFetchError:
-                    # keep the honest NASA UNAVAILABLE payload
-                    self._cache.set(cache_key, payload)
                     return payload
-            self._cache.set(cache_key, payload)
             return payload
 
         # No NASA token configured.
@@ -364,19 +467,15 @@ class TerrainService:
         )
         if fallback:
             try:
-                payload = self._proxy_openmeteo(
+                return self._proxy_openmeteo(
                     latitude, longitude, fallback=True,
                     fallback_reason=(
                         "NASA SRTM not configured; serving configured Open-Meteo fallback."
                     ),
                 )
-                self._cache.set(cache_key, payload)
-                return payload
             except HttpFetchError:
                 reason = "NASA Earthdata token not configured and Open-Meteo fallback failed."
-        payload = self._unavailable(latitude, longitude, "NOT_CONFIGURED", reason)
-        self._cache.set(cache_key, payload)
-        return payload
+        return self._unavailable(latitude, longitude, "NOT_CONFIGURED", reason)
 
     def _proxy_openmeteo(
         self,
@@ -531,7 +630,15 @@ class TerrainService:
                 try:
                     for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
                         pending.discard(future)
-                        p = future.result()
+                        try:
+                            p = future.result()
+                        except Exception:
+                            lat, lng = futures[future]
+                            _unavailable_cell(
+                                lat, lng,
+                                "Provider failed for this cell; marked UNAVAILABLE (values never invented).",
+                            )
+                            continue
                         statuses.add(p.get("data_status", "UNAVAILABLE"))
                         exported.append(
                             {
@@ -559,7 +666,14 @@ class TerrainService:
                 if time.monotonic() >= deadline:
                     _unavailable_cell(lat, lng, timeout_reason)
                     continue
-                p = self.get_terrain(lat, lng)
+                try:
+                    p = self.get_terrain(lat, lng)
+                except Exception:
+                    _unavailable_cell(
+                        lat, lng,
+                        "Provider failed for this cell; marked UNAVAILABLE (values never invented).",
+                    )
+                    continue
                 statuses.add(p.get("data_status", "UNAVAILABLE"))
                 exported.append(
                     {

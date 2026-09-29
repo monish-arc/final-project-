@@ -16,7 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.flood_forecast import get_flood_forecasts
+from app.flood_forecast import get_data_status, get_flood_forecasts
 from app.flood_service import CopernicusGloFASProvider
 
 client = TestClient(app)
@@ -199,3 +199,38 @@ def test_flood_forecast_unavailable_when_dataset_unreadable(monkeypatch):
         "FORECAST",
         "UNAVAILABLE",
     )
+
+
+# ---------------- terrain status honesty with the no-secret fallback ----------------
+
+def test_data_status_terrain_calculated_via_fallback_without_token(monkeypatch):
+    """Fresh-box default: no NASA token but the fallback is on -> the terrain
+    layer is still CALCULATED, sourced honestly from the Open-Meteo fallback."""
+    from app import config as _config
+    monkeypatch.setattr(_config, "NASA_EARTHDATA_TOKEN", "")
+    monkeypatch.setattr(_config, "NASA_TERRAIN_FALLBACK_OPENMETEO", True)
+    layers = {layer["layer"]: layer for layer in get_data_status()}
+    assert layers["terrain"]["status"] == "CALCULATED"
+    assert "Open-Meteo" in layers["terrain"]["source"]
+    assert "not configured" in layers["terrain"]["source"].lower()
+    assert "SRTMGL1" not in layers["terrain"].get("version", "")
+
+
+def test_data_status_terrain_not_configured_when_no_provider(monkeypatch):
+    """Neither SRTM nor the fallback -> terrain reports NOT_CONFIGURED honestly."""
+    from app import config as _config
+    monkeypatch.setattr(_config, "NASA_EARTHDATA_TOKEN", "")
+    monkeypatch.setattr(_config, "NASA_TERRAIN_FALLBACK_OPENMETEO", False)
+    layers = {layer["layer"]: layer for layer in get_data_status()}
+    assert layers["terrain"]["status"] == "NOT_CONFIGURED"
+
+
+def test_data_status_terrain_source_is_nasa_when_token_configured(monkeypatch):
+    """With a token, NASA SRTM is the provider of record on the status panel."""
+    from app import config as _config
+    monkeypatch.setattr(_config, "NASA_EARTHDATA_TOKEN", "fake-token")
+    monkeypatch.setattr(_config, "NASA_TERRAIN_FALLBACK_OPENMETEO", False)
+    layers = {layer["layer"]: layer for layer in get_data_status()}
+    assert layers["terrain"]["status"] == "CALCULATED"
+    assert "NASA" in layers["terrain"]["source"]
+    assert layers["terrain"].get("version", "").startswith("SRTMGL1")

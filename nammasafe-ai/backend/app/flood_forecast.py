@@ -242,16 +242,27 @@ def get_data_status() -> List[Dict[str, str]]:
     bhuvan_route_source = "Bhuvan / ISRO intra-state shortest path"
     bhuvan_geoid_source = "Bhuvan / ISRO CartoDEM v3R1 geoid tile proxy"
 
-    terrain_status = "CALCULATED" if (_config and _config.NASA_EARTHDATA_TOKEN) else "NOT_CONFIGURED"
+    terrain_configured = bool(
+        _config and (_config.NASA_EARTHDATA_TOKEN or _config.NASA_TERRAIN_FALLBACK_OPENMETEO)
+    )
+    terrain_status = "CALCULATED" if terrain_configured else "NOT_CONFIGURED"
     terrain_provenance = (
         {"version": "SRTMGL1 v003 (LP DAAC)", "spatial_resolution": "1 arc-second (~30 m)"}
-        if terrain_status == "CALCULATED"
-        else {}
+        if (_config and _config.NASA_EARTHDATA_TOKEN)
+        else (
+            {"version": "Open-Meteo elevation (SRTM/COP90)", "spatial_resolution": "~0.1°"}
+            if terrain_status == "CALCULATED"
+            else {}
+        )
     )
     terrain_source = (
         "NASA Earthdata SRTM (LP DAAC SRTMGL1 v003)"
         if (_config and _config.NASA_EARTHDATA_TOKEN)
-        else "NASA Earthdata SRTM not configured (Open-Meteo fallback disabled by default)"
+        else (
+            "Open-Meteo elevation fallback (NASA Earthdata token not configured)"
+            if terrain_status == "CALCULATED"
+            else "NASA Earthdata SRTM not configured (Open-Meteo fallback disabled)"
+        )
     )
 
     # Provenance metadata for the science layers (honest: retrieval/validity/

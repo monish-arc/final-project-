@@ -21,6 +21,8 @@ from __future__ import annotations
 import io
 import math
 import sys
+import threading
+import time
 import zipfile
 from array import array
 from typing import Any, Dict, Optional, Tuple
@@ -34,6 +36,23 @@ VOID_VALUE = -32768
 # Approximate metres per degree at the equator / latitude (WGS84).
 _M_PER_DEG_LAT = 110574.0
 _M_PER_DEG_LON_EQ = 111320.0
+
+# NASA LP DAAC answers HTTP 429 when a token bursts past its rate limit. Park
+# requests for a short module-local cooldown so terrain grids never hammer a
+# throttled Earthdata distribution node into a sustained block.
+_NASA_COOLDOWN_UNTIL = 0.0
+_NASA_COOLDOWN_LOCK = threading.Lock()
+
+
+def _nasa_in_cooldown() -> bool:
+    with _NASA_COOLDOWN_LOCK:
+        return time.monotonic() < _NASA_COOLDOWN_UNTIL
+
+
+def _mark_nasa_cooldown(seconds: float) -> None:
+    global _NASA_COOLDOWN_UNTIL
+    with _NASA_COOLDOWN_LOCK:
+        _NASA_COOLDOWN_UNTIL = time.monotonic() + max(1.0, float(seconds))
 
 
 class NasaElevationError(HttpFetchError):
@@ -97,12 +116,17 @@ class NasaSrtmElevationClient:
         """Fetch + unzip one HGT tile; raises typed errors on auth/missing/5xx."""
         if not self.configured():
             raise NasaAuthError("NASA Earthdata token is not configured")
+        if _nasa_in_cooldown():
+            raise NasaElevationError("NASA Earthdata is in its rate-limit cooldown window")
         url = self._tile_url(self._url_template, tile)
         response = http_get_bytes(
             url,
             timeout=self._timeout,
             headers={"Authorization": f"Bearer {self._token}"},
         )
+        if response.status_code == 429:
+            _mark_nasa_cooldown(config.WEATHER_PROVIDER_COOLDOWN_SEC)
+            raise NasaElevationError("NASA Earthdata throttled the request (HTTP 429)")
         if response.status_code == 401 or response.status_code == 403:
             raise NasaAuthError(f"NASA Earthdata rejected the credentials ({response.status_code})")
         if response.status_code == 404:
