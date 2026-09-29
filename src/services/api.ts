@@ -58,6 +58,7 @@ import {
   INFRASTRUCTURE_ITEMS,
   DEMO_USERS,
 } from '../data/mockData';
+import { apiUrl } from './apiBase';
 
 // ---- weather grid client cache ----
 // The map stays cache-first across pans/timeline stops so repeated identical
@@ -142,7 +143,7 @@ export async function fetchWithTimeout(
   }, ms);
   try {
     try {
-      return await fetch(url, { ...init, signal: controller.signal });
+      return await fetch(apiUrl(url), { ...init, signal: controller.signal });
     } catch (error) {
       if (didTimeOut && !external?.aborted) {
         throw new ApiTimeoutError(`Request timed out after ${ms} ms`);

@@ -1,4 +1,5 @@
 import { Habitation, RegionSelection } from '../types';
+import { apiUrl } from '../services/apiBase';
 
 export interface RegionViewportFocus {
   lat: number;
@@ -169,7 +170,7 @@ async function geocodeRegion(query: string, zoom: number): Promise<GeocodeCacheE
   const token = readAuthToken();
   try {
     const res = await withTimeout(
-      `/api/geocode?format=json&limit=1&q=${encodeURIComponent(query)}&country=in`,
+      apiUrl(`/api/geocode?format=json&limit=1&q=${encodeURIComponent(query)}&country=in`),
       {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       },
