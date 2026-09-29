@@ -1,0 +1,255 @@
+{
+  "data_class": "curated_demo",
+  "pilot_district": "Chamoli",
+  "pilot_state": "Uttarakhand",
+  "description": "Curated Chamoli pilot road graph approximating the NH-07 Alaknanda corridor, Dhauliganga/Rishiganga access roads, Nandakini valley, Pindar valley and the Karnaprayag-Gwaldam southern egress. LABELLED CURATED/DEMO - not an official road dataset and never presented as live network data.",
+  "nodes": {
+    "n-gauchar": {
+      "lat": 30.29,
+      "lng": 79.155,
+      "name": "Gauchar (NH-07)"
+    },
+    "n-karanprayag": {
+      "lat": 30.265,
+      "lng": 79.225,
+      "name": "Karnaprayag (NH-07)"
+    },
+    "n-nandprayag": {
+      "lat": 30.335,
+      "lng": 79.315,
+      "name": "Nandprayag (NH-07)"
+    },
+    "n-chamoli": {
+      "lat": 30.425,
+      "lng": 79.372,
+      "name": "Chamoli (NH-07)"
+    },
+    "n-gopeshwar": {
+      "lat": 30.412,
+      "lng": 79.328,
+      "name": "Gopeshwar (District HQ)"
+    },
+    "n-pipalkoti": {
+      "lat": 30.43,
+      "lng": 79.43,
+      "name": "Pipalkoti (NH-07)"
+    },
+    "n-helang": {
+      "lat": 30.528,
+      "lng": 79.51,
+      "name": "Helang (NH-07)"
+    },
+    "n-joshimath": {
+      "lat": 30.5574,
+      "lng": 79.5658,
+      "name": "Joshimath (NH-07)"
+    },
+    "n-urgam": {
+      "lat": 30.56,
+      "lng": 79.44,
+      "name": "Urgam (Kalpeshwar)"
+    },
+    "n-tapovan": {
+      "lat": 30.495,
+      "lng": 79.63,
+      "name": "Tapovan (Dhauliganga)"
+    },
+    "n-raini": {
+      "lat": 30.4851,
+      "lng": 79.6974,
+      "name": "Raini (Rishiganga)"
+    },
+    "n-pandukeshwar": {
+      "lat": 30.635,
+      "lng": 79.555,
+      "name": "Pandukeshwar (NH-07)"
+    },
+    "n-mana": {
+      "lat": 30.768,
+      "lng": 79.495,
+      "name": "Mana / Badrinath Approach"
+    },
+    "n-gwaldam": {
+      "lat": 30.015,
+      "lng": 79.56,
+      "name": "Gwaldam"
+    },
+    "n-tharali": {
+      "lat": 30.075,
+      "lng": 79.505,
+      "name": "Tharali (Pindar)"
+    },
+    "n-ghat": {
+      "lat": 30.26,
+      "lng": 79.48,
+      "name": "Ghat (Nandakini)"
+    },
+    "n-narayanbagar": {
+      "lat": 30.11,
+      "lng": 79.44,
+      "name": "Narayanbagar (K-G Road)"
+    }
+  },
+  "edges": [
+    {
+      "id": "e-gauchar-karanprayag",
+      "from": "n-gauchar",
+      "to": "n-karanprayag",
+      "name": "NH-07 Gauchar-Karnaprayag",
+      "road_class": "primary",
+      "bridge": false,
+      "slope_class": "flat",
+      "length_m": 11000
+    },
+    {
+      "id": "e-karanprayag-nandprayag",
+      "from": "n-karanprayag",
+      "to": "n-nandprayag",
+      "name": "NH-07 Karnaprayag-Nandprayag",
+      "road_class": "primary",
+      "bridge": true,
+      "slope_class": "flat",
+      "length_m": 13500
+    },
+    {
+      "id": "e-nandprayag-chamoli",
+      "from": "n-nandprayag",
+      "to": "n-chamoli",
+      "name": "NH-07 Nandprayag-Chamoli",
+      "road_class": "primary",
+      "bridge": true,
+      "slope_class": "moderate",
+      "length_m": 12500
+    },
+    {
+      "id": "e-chamoli-pipalkoti",
+      "from": "n-chamoli",
+      "to": "n-pipalkoti",
+      "name": "NH-07 Chamoli-Pipalkoti",
+      "road_class": "primary",
+      "bridge": false,
+      "slope_class": "moderate",
+      "length_m": 6500
+    },
+    {
+      "id": "e-chamoli-gopeshwar",
+      "from": "n-chamoli",
+      "to": "n-gopeshwar",
+      "name": "Chamoli-Gopeshwar Road",
+      "road_class": "secondary",
+      "bridge": false,
+      "slope_class": "moderate",
+      "length_m": 7000
+    },
+    {
+      "id": "e-pipalkoti-helang",
+      "from": "n-pipalkoti",
+      "to": "n-helang",
+      "name": "NH-07 Pipalkoti-Helang",
+      "road_class": "primary",
+      "bridge": false,
+      "slope_class": "moderate",
+      "length_m": 16000
+    },
+    {
+      "id": "e-helang-joshimath",
+      "from": "n-helang",
+      "to": "n-joshimath",
+      "name": "NH-07 Helang-Joshimath",
+      "road_class": "primary",
+      "bridge": true,
+      "slope_class": "moderate",
+      "length_m": 11500
+    },
+    {
+      "id": "e-joshimath-pandukeshwar",
+      "from": "n-joshimath",
+      "to": "n-pandukeshwar",
+      "name": "NH-07 Joshimath-Pandukeshwar",
+      "road_class": "primary",
+      "bridge": true,
+      "slope_class": "moderate",
+      "length_m": 15000
+    },
+    {
+      "id": "e-pandukeshwar-mana",
+      "from": "n-pandukeshwar",
+      "to": "n-mana",
+      "name": "NH-07 Pandukeshwar-Mana",
+      "road_class": "primary",
+      "bridge": false,
+      "slope_class": "steep",
+      "length_m": 22000
+    },
+    {
+      "id": "e-joshimath-tapovan",
+      "from": "n-joshimath",
+      "to": "n-tapovan",
+      "name": "Joshimath-Tapovan Access",
+      "road_class": "secondary",
+      "bridge": false,
+      "slope_class": "moderate",
+      "length_m": 12500
+    },
+    {
+      "id": "e-tapovan-raini",
+      "from": "n-tapovan",
+      "to": "n-raini",
+      "name": "Tapovan-Raini (Rishiganga)",
+      "road_class": "secondary",
+      "bridge": true,
+      "slope_class": "steep",
+      "length_m": 10500
+    },
+    {
+      "id": "e-helang-urgam",
+      "from": "n-helang",
+      "to": "n-urgam",
+      "name": "Helang-Urgam (Kalpeshwar)",
+      "road_class": "rural",
+      "bridge": true,
+      "slope_class": "steep",
+      "length_m": 10000
+    },
+    {
+      "id": "e-nandprayag-ghat",
+      "from": "n-nandprayag",
+      "to": "n-ghat",
+      "name": "Nandprayag-Ghat (Nandakini)",
+      "road_class": "rural",
+      "bridge": true,
+      "slope_class": "moderate",
+      "length_m": 23000
+    },
+    {
+      "id": "e-karanprayag-narayanbagar",
+      "from": "n-karanprayag",
+      "to": "n-narayanbagar",
+      "name": "K-G Road Karnaprayag-Narayanbagar",
+      "road_class": "secondary",
+      "bridge": false,
+      "slope_class": "steep",
+      "length_m": 34000
+    },
+    {
+      "id": "e-narayanbagar-gwaldam",
+      "from": "n-narayanbagar",
+      "to": "n-gwaldam",
+      "name": "K-G Road Narayanbagar-Gwaldam",
+      "road_class": "secondary",
+      "bridge": false,
+      "slope_class": "steep",
+      "length_m": 18000
+    },
+    {
+      "id": "e-gwaldam-tharali",
+      "from": "n-gwaldam",
+      "to": "n-tharali",
+      "name": "Gwaldam-Tharali (Pindar)",
+      "road_class": "rural",
+      "bridge": false,
+      "slope_class": "moderate",
+      "length_m": 11500
+    }
+  ]
+}

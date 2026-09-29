@@ -1,0 +1,84 @@
+version: "3.8"
+
+services:
+  # 1. PostgreSQL with PostGIS Spatial Database
+  db:
+    image: postgis/postgis:15-3.3
+    container_name: nammasafe-db
+    restart: always
+    environment:
+      POSTGRES_USER: nammasafe
+      POSTGRES_PASSWORD: nammasafe123
+      POSTGRES_DB: nammasafe_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./nammasafe-ai/database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nammasafe -d nammasafe_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nammasafe-network
+
+  # 2. Python FastAPI Backend Service & Decision Engine
+  backend:
+    build:
+      context: ./nammasafe-ai/backend
+      dockerfile: Dockerfile
+    container_name: nammasafe-backend
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://nammasafe:nammasafe123@db:5432/nammasafe_db
+      JWT_SECRET: nammasafe-super-secret-key-chamoli-2025
+      PILOT_DISTRICT: Chamoli
+      PILOT_STATE: Uttarakhand
+      # Override live-data credentials at deploy time. The gitignored
+      # backend/.env (GPM_MODE, EARTHDATA_USERNAME, EARTHDATA_TOKEN,
+      # GPM_DATA_DIR) is bind-mounted with the code below, so it is picked up
+      # automatically when present. Never bake secrets into this file.
+      # GPM_MODE: "on"
+      # GPM_DATA_DIR: "/app/data/gpm"
+      # EARTHDATA_USERNAME: "..."
+      # EARTHDATA_TOKEN: "..."
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./nammasafe-ai/backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    networks:
+      - nammasafe-network
+
+  # 3. React Vite GIS Frontend Platform
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: nammasafe-frontend
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - nammasafe-network
+
+volumes:
+  pgdata:
+    driver: local
+
+networks:
+  nammasafe-network:
+    driver: bridge
