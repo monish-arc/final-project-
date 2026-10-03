@@ -1,4 +1,4 @@
-{
+{{
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "services": {
     "app": {
@@ -7,7 +7,8 @@
     },
     "backend": {
       "root": "nammasafe-ai/backend",
-      "framework": "fastapi"
+      "framework": "fastapi",
+      "entrypoint": "app.main:app"
     }
   },
   "rewrites": [
