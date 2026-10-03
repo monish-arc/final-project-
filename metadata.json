@@ -1,6 +1,6 @@
 {
   "name": "SafeMove AI",
-  "description": "Proactive Red-Zone and Relocation Planning Platform for disaster-prone regions like Chamoli, Uttarakhand",
+  "description": "Proactive Red-Zone and Relocation Planning Platform for disaster-prone regions in all over india ",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

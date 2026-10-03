@@ -8,6 +8,7 @@ import { DataSourceStatus } from './DataSourceStatus';
 import { HistoricalDistrictPanel } from './HistoricalDistrictPanel';
 import { apiService } from '../services/api';
 import { TERRAIN_SOURCE, terrainPointPopupHtml, type TerrainPointUnavailable } from '../lib/terrainPopup';
+const ESRI_API_KEY = import.meta.env.VITE_ESRI_API_KEY;
 
 interface LeafletMapProps {
   habitations: Habitation[];
@@ -350,19 +351,19 @@ export const LeafletMap: React.FC<LeafletMapProps> = ({
         // CartoDB only_labels tiles are transparent PNG — no opaque background,
         // so satellite imagery stays fully visible with labels/roads on top.
         const imagery = L.tileLayer(
-          'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-          {
-            attribution: `${ESRI_ATTR} — Source: Esri, Maxar, Earthstar Geographics`,
-            maxZoom: 18,
+          `https://ibasemaps-api.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?token=${ESRI_API_KEY}`,
+         {
+           attribution: `${ESRI_ATTR} • Source: Esri, Maxar, Earthstar Geographics`,
+           maxZoom: 18,
           }
         );
         const labels = L.tileLayer(
-          'https://basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}.png',
-          {
-            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/">CARTO</a>',
-            maxZoom: 18,
+          'https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+         {
+           attribution: '© Esri',
+           maxZoom: 18,
           }
-        );
+       );
         labels.on('tileerror', () => setBasemapError('MAP SOURCE UNAVAILABLE — labels unavailable'));
         basemapLayerRef.current = L.layerGroup([imagery, labels]).addTo(map);
       } else if (basemap === 'terrain') {
