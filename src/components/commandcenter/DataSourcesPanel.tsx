@@ -10,8 +10,15 @@ interface DataSourcesPanelProps {
 
 export const DataSourcesPanel: React.FC<DataSourcesPanelProps> = ({ dataStatus, checkedAt }) => {
   const layers = dataStatus ?? [];
-  const liveCount = layers.filter((l) =>
-    ['LIVE', 'MODEL', 'CALCULATED', 'FORECAST', 'AVAILABLE', 'CACHED', 'RECENT'].includes(String(l.status))
+  const statusOf = (l: DataStatusEntry): string => String(l.status ?? 'UNAVAILABLE');
+  // Only statuses that mean "currently serving" count as live. CACHED and
+  // CALCULATED are deliberately excluded: a cached or derived value is not the
+  // same claim as live data, and folding them in would overstate freshness.
+  const LIVE_STATUSES = ['LIVE', 'MODEL', 'FORECAST', 'RECENT'];
+  const liveCount = layers.filter((l) => LIVE_STATUSES.includes(statusOf(l))).length;
+  const cachedCount = layers.filter((l) => statusOf(l) === 'CACHED').length;
+  const unavailableCount = layers.filter((l) =>
+    ['UNAVAILABLE', 'ERROR', 'NOT CONFIGURED', 'NOT_CONFIGURED'].includes(statusOf(l))
   ).length;
 
   return (
@@ -21,7 +28,7 @@ export const DataSourcesPanel: React.FC<DataSourcesPanelProps> = ({ dataStatus, 
           <Database className="w-4 h-4 text-sm-green" />
           <div>
             <h3 className="text-xs font-bold uppercase tracking-wider text-sm-text">
-              Data Sources & Status
+              Data Sources &amp; Status
             </h3>
             <p className="text-[10px] text-sm-muted">
               Every layer reports the source that actually served it — honesty over hardcoded labels.
@@ -30,6 +37,8 @@ export const DataSourcesPanel: React.FC<DataSourcesPanelProps> = ({ dataStatus, 
         </div>
         <span className="text-[11px] text-sm-muted">
           {liveCount}/{layers.length} live
+          {cachedCount > 0 ? ` · ${cachedCount} cached` : ''}
+          {unavailableCount > 0 ? ` · ${unavailableCount} unavailable` : ''}
           {checkedAt ? ` · checked ${new Date(checkedAt).toLocaleTimeString()}` : ''}
         </span>
       </div>
@@ -59,6 +68,17 @@ export const DataSourcesPanel: React.FC<DataSourcesPanelProps> = ({ dataStatus, 
                       })}
                     </span>
                   ) : null}
+                  {/* Raw status from the backend, shown verbatim. `DataStatusBadge`
+                      normalises several distinct states (NOT CONFIGURED and ERROR
+                      both collapse to UNAVAILABLE) and is shared with the GIS map,
+                      so it is left untouched. Printing the raw value here keeps
+                      those statuses distinguishable without changing that badge. */}
+                  <span
+                    className="shrink-0 font-mono text-[10px] text-sm-muted border border-sm-border rounded px-1 py-0.5"
+                    title="Raw status reported by the backend"
+                  >
+                    {String(layer.status ?? 'UNAVAILABLE')}
+                  </span>
                   <DataStatusBadge status={status} title="" />
                 </span>
               </li>

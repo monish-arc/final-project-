@@ -180,6 +180,15 @@ export const Navbar: React.FC<NavbarProps> = ({
               <span className="absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full bg-sm-green" />
             </button>
           )}
+          <button
+            id="sign-out-btn"
+            onClick={onSignOut}
+            title="Logout"
+            aria-label="Logout"
+            className="relative flex items-center justify-center w-9 h-9 rounded-md bg-sm-panel-2 hover:bg-white/5 border border-sm-border text-sm-muted hover:text-sm-text transition cursor-pointer"
+          >
+            <LogOut className="w-4 h-4" />
+          </button>
           {!isCitizen && (
             <button
               id="reset-demo-data-btn"
@@ -297,15 +306,6 @@ export const Navbar: React.FC<NavbarProps> = ({
               <div className="w-8 h-8 rounded-full bg-sm-panel-2 border border-sm-border flex items-center justify-center font-bold text-xs text-sm-text shadow-sm">
                 {currentUser.full_name.charAt(0)}
               </div>
-              <button
-                id="sign-out-btn"
-                onClick={onSignOut}
-                title="Sign out"
-                aria-label="Sign out"
-                className="flex items-center justify-center w-8 h-8 rounded-md bg-sm-panel-2 hover:bg-white/5 border border-sm-border text-sm-muted hover:text-sm-text transition cursor-pointer"
-              >
-                <LogOut className="w-3.5 h-3.5" />
-              </button>
             </div>
           )}
         </div>

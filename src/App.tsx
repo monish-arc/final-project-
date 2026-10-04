@@ -12,6 +12,7 @@ import { SafeMoveLogo } from './components/SafeMoveLogo';
 import { DashboardPage } from './pages/DashboardPage';
 import { GisMapPage } from './pages/GisMapPage';
 import { WeatherForecastMapPage } from './pages/WeatherForecastMapPage';
+import { DataSourcesPanel } from './components/commandcenter/DataSourcesPanel';
 import { HabitationsPage } from './pages/HabitationsPage';
 import { PriorityPage } from './pages/PriorityPage';
 import { SimulatorPage } from './pages/SimulatorPage';
@@ -703,6 +704,15 @@ export default function App() {
                   relocationSites={relocationSites}
                   recommendations={recommendations}
                 />
+              )}
+
+              {activeTab === 'data_sources' && (
+                <div className="space-y-3">
+                  <DataSourcesPanel
+                    dataStatus={dataStatus}
+                    checkedAt={dataLastUpdated ? dataLastUpdated.toISOString() : null}
+                  />
+                </div>
               )}
 
               {activeTab === 'admin' && (

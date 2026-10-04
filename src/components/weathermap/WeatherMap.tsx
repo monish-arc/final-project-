@@ -12,6 +12,7 @@ import {
   Map as MapIcon,
   Pause,
   Play,
+  RotateCcw,
   Search,
   SkipBack,
   SkipForward,
@@ -49,6 +50,15 @@ import {
   isHistoricalVariableAvailable,
   variableLabel,
 } from '../../lib/weatherLayers';
+import {
+  DEFAULT_RASTER_OPACITY,
+  RASTER_OPACITY_PRESETS,
+  paintGridRaster,
+  rasterOpacityValue,
+  toOpaqueColor,
+  type RasterBounds,
+  type RasterOpacityId,
+} from './WeatherGridRaster';
 
 const MAX_GRID_POINTS = 400;
 const STEP_CANDIDATES = [0.05, 0.075, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5];
@@ -139,22 +149,12 @@ export interface WeatherMapProps {
   canManageLiveProviders?: boolean;
 }
 
-function gridCellBounds(
-  p: { latitude: number; longitude: number },
-  stepLat: number,
-  stepLng: number,
-  bounds: { north: number; south: number; east: number; west: number }
-): L.LatLngBoundsExpression {
-  const halfLat = Math.max(stepLat / 2, 0.01);
-  const halfLng = Math.max(stepLng / 2, 0.01);
-  const s = Math.max(bounds.south, p.latitude - halfLat);
-  const n = Math.min(bounds.north, p.latitude + halfLat);
-  const w = Math.max(bounds.west, p.longitude - halfLng);
-  const e = Math.min(bounds.east, p.longitude + halfLng);
-  return [
-    [s, w],
-    [n, e],
-  ];
+/** Parse the "north,south,east,west" viewport string into raster bounds. */
+function parseViewportBounds(raw: string): RasterBounds | null {
+  const parts = raw.split(',').map((v) => Number(v));
+  if (parts.length !== 4 || parts.some((v) => !Number.isFinite(v))) return null;
+  const [north, south, east, west] = parts;
+  return { north, south, east, west };
 }
 
 export const WeatherMap: React.FC<WeatherMapProps> = ({
@@ -166,6 +166,8 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
   const mapRef = useRef<L.Map | null>(null);
   const weatherLayerRef = useRef<L.LayerGroup | null>(null);
   const floodLayerRef = useRef<L.LayerGroup | null>(null);
+  const weatherRasterRef = useRef<L.ImageOverlay | null>(null);
+  const floodRasterRef = useRef<L.ImageOverlay | null>(null);
   const windLayerRef = useRef<WindCanvas | null>(null);
   const markerRef = useRef<L.CircleMarker | null>(null);
   const basemapLayerRef = useRef<L.Layer | null>(null);
@@ -178,6 +180,9 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
   const [hour, setHour] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [windOn, setWindOn] = useState(false);
+  // Opacity of the weather/flood raster. Defaults to a light wash so the street
+  // map stays clearly readable underneath the forecast colours.
+  const [rasterOpacity, setRasterOpacity] = useState<RasterOpacityId>(DEFAULT_RASTER_OPACITY);
 
   // Historical (ERA5 archive) mode. The map opens in historical mode on the
   // default archive year so NO live forecast request is ever armed implicitly;
@@ -211,7 +216,7 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
   const pickerSeqRef = useRef(0);
 
   const [layersOpen, setLayersOpen] = useState(true);
-  const [sourcesOpen, setSourcesOpen] = useState(false);
+  const [historicalBarOpen, setHistoricalBarOpen] = useState(true);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<Array<{ name: string; lat: number; lng: number }>>([]);
@@ -285,6 +290,8 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
         map.removeLayer(windLayerRef.current as unknown as L.Layer);
         windLayerRef.current = null;
       }
+      weatherRasterRef.current = null;
+      floodRasterRef.current = null;
       map.remove();
       mapRef.current = null;
     };
@@ -365,39 +372,53 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
     }
     basemapLayerRef.current = layer;
     layer.addTo(map);
+    // Dependency is deliberately ONLY `basemap`. This used to include
+    // `viewportKey`, which changes 500ms after every pan/zoom — so the whole
+    // OpenStreetMap tile layer was destroyed and rebuilt after each zoom
+    // gesture. That is the "flicker"/tile-reload the desktop users reported.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [basemap, viewportKey]);
+  }, [basemap]);
 
   // ---------------- focus / initial view ----------------
-  useEffect(() => {
+  // Camera framing lives here and nowhere else. It runs on mount and on an
+  // explicit region change, and on demand from the "reset view" button. It is
+  // deliberately NOT driven by `viewportKey` — doing that used to re-fit the map
+  // 500ms after every pan/zoom, discarding the user's chosen zoom.
+  const applyFocusView = useCallback((): void => {
     const map = mapRef.current;
     if (!map) return;
-    const apply = (): void => {
-      const b = focus?.bounds ?? INDIA_OVERVIEW.bounds;
-      if (b && b.length === 4) {
-        map.fitBounds(
-          [
-            [b[0], b[1]],
-            [b[2], b[3]],
-          ],
-          { padding: [12, 12], animate: false }
-        );
-      } else if (focus) {
-        const z = Number.isFinite(focus.zoom) ? Math.round(focus.zoom) : INDIA_OVERVIEW.zoom;
-        map.setView([focus.lat, focus.lng], z, { animate: false });
-      } else {
-        map.fitBounds(
-          [
-            [INDIA_OVERVIEW.bounds![0], INDIA_OVERVIEW.bounds![1]],
-            [INDIA_OVERVIEW.bounds![2], INDIA_OVERVIEW.bounds![3]],
-          ],
-          { animate: false }
-        );
-      }
-    };
-    const raf = window.requestAnimationFrame(apply);
+    const b = focus?.bounds ?? INDIA_OVERVIEW.bounds;
+    if (b && b.length === 4) {
+      map.fitBounds(
+        [
+          [b[0], b[1]],
+          [b[2], b[3]],
+        ],
+        { padding: [12, 12], animate: false }
+      );
+    } else if (focus) {
+      const z = Number.isFinite(focus.zoom) ? Math.round(focus.zoom) : INDIA_OVERVIEW.zoom;
+      map.setView([focus.lat, focus.lng], z, { animate: false });
+    } else {
+      map.fitBounds(
+        [
+          [INDIA_OVERVIEW.bounds![0], INDIA_OVERVIEW.bounds![1]],
+          [INDIA_OVERVIEW.bounds![2], INDIA_OVERVIEW.bounds![3]],
+        ],
+        { animate: false }
+      );
+    }
+  }, [focus]);
+
+  useEffect(() => {
+    const raf = window.requestAnimationFrame(applyFocusView);
     return () => window.cancelAnimationFrame(raf);
-  }, [focus, viewportKey]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus]);
+
+  const resetView = (): void => {
+    applyFocusView();
+  };
 
   // ---------------- grid fetch ----------------
   const fetchGrid = useCallback(
@@ -610,11 +631,16 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
     }
   }, [windActive, windField]);
 
-  // ---------------- rendering weather/hazard grid ----------------
+// ---------------- rendering weather/hazard raster ----------------
+  // The grid is painted into a single canvas and shown as one non-interactive
+  // imageOverlay instead of ~13,000 SVG rectangles. This keeps the OpenStreetMap
+  // base legible underneath, keeps map clicks (and the point picker) working,
+  // and lets pinch/drag stay smooth on a phone.
   useEffect(() => {
     const layer = weatherLayerRef.current;
     if (!layer) return;
     layer.clearLayers();
+    weatherRasterRef.current = null;
     if (feed.kind === 'flood') return;
     const g = grid;
     if (!g || g.points.length === 0) return;
@@ -622,67 +648,74 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
     const meta = WEATHER_LAYERS[v] ?? WEATHER_LAYERS.temperature_2m;
     const stepLat = g.steps?.latitude || 0.25;
     const stepLng = g.steps?.longitude || 0.25;
-    for (const p of g.points) {
-      const hasValue = p.value != null;
-      const rect = L.rectangle(gridCellBounds(p, stepLat, stepLng, g.bounds), {
-        color: 'rgba(15,23,42,0.25)',
-        weight: 0.4,
-        fillColor: hasValue ? colorForValue(p.value as number, meta) : '#94a3b8',
-        fillOpacity: hasValue ? 0.72 : 0.12,
-      });
-      rect.bindPopup(
-        `<div style="font-size:11px;line-height:1.5">
-          <b>${escapeHtml(meta.label)}</b><br/>
-          ${p.latitude.toFixed(3)}, ${p.longitude.toFixed(3)}<br/>
-          <b style="font-size:12px">${hasValue ? formatVariableValue(v, p.value as number) : 'no data'}</b>
-          ${p.data_status ? `<br/><span style="color:#64748b">${escapeHtml(String(p.data_status))}</span>` : ''}
-        </div>`,
-        { maxWidth: 240 }
-      );
-      rect.on('click', () => {
-        const marker = markerRef.current;
-        if (marker) marker.remove();
-        markerRef.current = L.circleMarker([p.latitude, p.longitude], {
-          radius: 6,
-          color: '#e2e8f0',
-          weight: 1.5,
-          fillColor: hasValue ? colorForValue(p.value as number, meta) : '#64748b',
-          fillOpacity: 0.95,
-        }).addTo(mapRef.current!);
-      });
-      rect.addTo(layer);
-    }
+    const raster = paintGridRaster(
+      g.points.map((p) => ({
+        lat: p.latitude,
+        lng: p.longitude,
+        // No-data cells stay transparent rather than being painted grey, so the
+        // base map shows through wherever the provider returned nothing.
+        color: p.value != null ? colorForValue(p.value, meta) : null,
+      })),
+      g.bounds,
+      stepLat,
+      stepLng
+    );
+    if (!raster) return;
+    const overlay = L.imageOverlay(
+      raster.url,
+      [
+        [g.bounds.south, g.bounds.west],
+        [g.bounds.north, g.bounds.east],
+      ],
+      { opacity: rasterOpacityValue(rasterOpacity), interactive: false }
+    );
+    overlay.addTo(layer);
+    weatherRasterRef.current = overlay;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [grid, feed]);
 
-  // ---------------- rendering flood overlay ----------------
+  // ---------------- rendering flood raster ----------------
+  // Same single-canvas treatment as the weather grid. The flood response carries
+  // no bounds/steps of its own, so we keep the viewport window and 0.3 deg step
+  // the previous rectangle overlay used.
   useEffect(() => {
     const layer = floodLayerRef.current;
     if (!layer) return;
     layer.clearLayers();
+    floodRasterRef.current = null;
     if (feed.kind !== 'flood' || !floodGrid) return;
-    for (const p of floodGrid.points) {
-      if (p.risk_score == null) continue;
-      const color = FLOOD_RISK_COLORS[p.risk_level ?? 'LOW'] ?? 'rgba(148,163,184,0.3)';
-      const rect = L.rectangle(gridCellBounds(p, 0.3, 0.3, { north: Number(viewportBounds.split(',')[0]), south: Number(viewportBounds.split(',')[1]), east: Number(viewportBounds.split(',')[2]), west: Number(viewportBounds.split(',')[3]) }), {
-        color: 'rgba(15,23,42,0.3)',
-        weight: 0.4,
-        fillColor: color,
-        fillOpacity: 0.6,
-      });
-      rect.bindPopup(
-        `<div style="font-size:11px;line-height:1.6">
-          <b style="color:#b91c1c">Flood risk: ${p.risk_level}</b><br/>
-          Score: <b>${p.risk_score}</b>/100<br/>
-          Factors: ${escapeHtml((p.contributing_factors ?? []).join(', ') || '—')}<br/>
-          <span style="color:#64748b">Rule-based overlay (${isHistorical ? `ERA5 ${monthPeriodLabel(historicalYear!, historicalMonth!)} + ` : ''}SRTM terrain)</span>
-        </div>`,
-        { maxWidth: 260 }
-      );
-      rect.addTo(layer);
-    }
+    const bounds = parseViewportBounds(viewportBounds);
+    if (!bounds) return;
+    const raster = paintGridRaster(
+      floodGrid.points.map((p) => ({
+        lat: p.latitude,
+        lng: p.longitude,
+        color: p.risk_score == null ? null : toOpaqueColor(FLOOD_RISK_COLORS[p.risk_level ?? 'LOW'] ?? 'rgb(148,163,184)'),
+      })),
+      bounds,
+      0.3,
+      0.3
+    );
+    if (!raster) return;
+    const overlay = L.imageOverlay(
+      raster.url,
+      [
+        [bounds.south, bounds.west],
+        [bounds.north, bounds.east],
+      ],
+      { opacity: rasterOpacityValue(rasterOpacity), interactive: false }
+    );
+    overlay.addTo(layer);
+    floodRasterRef.current = overlay;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [floodGrid, feed, viewportKey, isHistorical, historicalYear, historicalMonth]);
+
+  // Keep both rasters at the user-chosen opacity without rebuilding the canvas.
+  useEffect(() => {
+    const opacity = rasterOpacityValue(rasterOpacity);
+    weatherRasterRef.current?.setOpacity(opacity);
+    floodRasterRef.current?.setOpacity(opacity);
+  }, [rasterOpacity]);
 
   // ---------------- picker ----------------
   useEffect(() => {
@@ -874,112 +907,330 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
         : null;
 
   return (
-    <div data-weather-map-root className="absolute inset-0 rounded-xl overflow-hidden border border-slate-700 shadow-2xl bg-[#0a0e1a] select-none">
-      <div ref={containerRef} id="weather-hazard-map-canvas" className="absolute inset-0 z-0" />
-
-      {/* ------------ Top bar ------------ */}
-      <div className="absolute top-0 left-0 right-0 z-30 pointer-events-none">
-        <div className="m-2 sm:m-3 flex flex-wrap items-center gap-2">
-          <div className="pointer-events-auto flex items-center gap-2 bg-slate-950/80 backdrop-blur-md border border-slate-700/80 rounded-xl px-3 py-1.5">
-            <CloudSun className="w-4 h-4 text-sky-400" />
-            <span className="text-xs font-bold text-slate-100 whitespace-nowrap">{regionLabel}</span>
-            {gridStatus && <StatusChip status={gridStatus} />}
-            {isHistorical && (
-              <span
-                className="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 font-bold text-[10px] tracking-wide uppercase"
-                style={{ color: statusColor('HISTORICAL'), backgroundColor: `${statusColor('HISTORICAL')}1f` }}
-                id="weather-historical-badge"
-                title={`Historical ERA5 reanalysis, completed month ${monthPeriodLabel(historicalYear!, historicalMonth!)}`}
-              >
-                <CalendarDays className="w-3 h-3" />
-                {monthPeriodLabel(historicalYear!, historicalMonth!)}
+    <div
+      data-weather-map-root
+      className="relative isolate flex flex-col rounded-xl border border-slate-700 bg-[#0a0e1a] shadow-2xl select-none"
+    >
+      {/* =================================================================
+          Control stack — laid out in NORMAL FLOW above the map.
+          Order: 1) location/header, 2) Historical date control, 3) Layers.
+          Nothing here is absolutely positioned over the map, so the panels can
+          never overlap the map or each other, and they scroll away with the
+          page instead of floating over it.
+          ================================================================= */}
+      <div className="shrink-0 border-b border-slate-800 bg-[#0a0e1a]">
+        {/* ---------- Row 1: location / header ---------- */}
+        <div className="flex flex-wrap items-center gap-2 border-b border-slate-800/70 px-3 py-2">
+          <div className="flex items-center gap-2">
+            <CloudSun className="w-4 h-4 text-sky-400 shrink-0" />
+            <span className="min-w-0">
+              <span className="block text-xs font-bold uppercase tracking-wide text-slate-100 truncate">
+                {regionLabel}
               </span>
-            )}
-            {isHistorical && (
-              <span
-                className="inline-flex items-center rounded-full px-2 py-0.5 font-bold text-[10px] tracking-wide uppercase text-amber-300 border border-amber-500/50 bg-amber-950/70"
-                id="weather-archival-chip"
-              >
-                HISTORICAL DATA · ERA5 ARCHIVE · NOT LIVE
+              <span className="block text-[10px] font-normal normal-case tracking-normal text-slate-400 whitespace-nowrap">
+                | Weather &amp; Hazard Forecast
               </span>
-            )}
+            </span>
           </div>
-
-          {viewOutsideIndia && (
-            <div
-              className="pointer-events-auto flex items-center gap-2 bg-amber-900/60 backdrop-blur-md border border-amber-600/70 rounded-xl px-3 py-1.5"
-              data-coverage-badge
+          {gridStatus && <StatusChip status={gridStatus} />}
+          {isHistorical && (
+            <span
+              className="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 font-bold text-[10px] tracking-wide uppercase"
+              style={{ color: statusColor('HISTORICAL'), backgroundColor: `${statusColor('HISTORICAL')}1f` }}
+              id="weather-historical-badge"
+              title={`Historical ERA5 reanalysis, completed month ${monthPeriodLabel(historicalYear!, historicalMonth!)}`}
             >
+              <CalendarDays className="w-3 h-3" />
+              {monthPeriodLabel(historicalYear!, historicalMonth!)}
+            </span>
+          )}
+          {isHistorical && (
+            <span
+              className="inline-flex items-center rounded-full px-2 py-0.5 font-bold text-[10px] tracking-wide uppercase text-amber-300 border border-amber-500/50 bg-amber-950/70"
+              id="weather-archival-chip"
+            >
+              HISTORICAL DATA · ERA5 ARCHIVE · NOT LIVE
+            </span>
+          )}
+          {viewOutsideIndia && (
+            <div className="flex items-center gap-2 rounded-xl border border-amber-600/70 bg-amber-900/60 px-2.5 py-1" data-coverage-badge>
               <Waves className="w-3.5 h-3.5 text-amber-300" />
               <span className="text-[11px] font-medium text-amber-100 whitespace-nowrap">
                 Outside India — showing empty grid
               </span>
             </div>
           )}
+        </div>
 
-          {/* Historical year + month selector (near location search) */}
-          {yearAvail.length > 0 && (
-            <div className="pointer-events-auto flex items-center gap-1.5 bg-slate-950/80 backdrop-blur-md border border-violet-700/60 rounded-xl px-2 py-1.5" id="weather-historical-selector">
-              <CalendarDays className="w-3.5 h-3.5 text-violet-400 shrink-0" />
-              <select
-                aria-label="Weather data mode"
-                className="text-[10px] font-bold bg-transparent text-slate-100 outline-none cursor-pointer"
-                value={historicalYear ?? 'live'}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  handleHistoricalYear(v === 'live' ? null : Number(v));
-                }}
+        {/* ---------- Row 2: Historical date control (single control) ---------- */}
+        {/* The year/month selects used to sit in the map's top bar while the
+            month timeline + day control sat in a separate bottom bar, giving two
+            competing historical controls. They are now one row.
+
+            Rendered whenever we have availability data OR we are already in
+            historical mode — otherwise a failed availability fetch would leave a
+            historical user with no way to change month, or to return to live. */}
+        {(yearAvail.length > 0 || isHistorical) && (
+          <div className="border-b border-slate-800/70 px-3 py-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                id="weather-historical-toggle"
+                onClick={() => setHistoricalBarOpen((o) => !o)}
+                aria-expanded={historicalBarOpen}
+                aria-controls="weather-historical-panel"
+                className="flex min-h-10 items-center gap-1.5 rounded-lg border border-violet-800/60 bg-violet-950/40 px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wider text-violet-100 hover:bg-violet-900/40"
               >
-                <option value="live">Live (today)</option>
-                {yearAvail.map((a) => (
-                  <option key={a.year} value={a.year}>
-                    {a.label} · through {String(a.completed_through_month).padStart(2, '0')}
-                  </option>
-                ))}
-              </select>
-              {isHistorical && (
+                <CalendarDays className="w-3.5 h-3.5 text-violet-300" />
+                Historical
+                {historicalBarOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
+              </button>
+
+              <div className="flex min-h-10 items-center gap-1.5 rounded-lg border border-violet-800/60 bg-violet-950/40 px-2 py-1.5" id="weather-historical-selector">
                 <select
-                  aria-label="Historical month"
-                  className="text-[10px] font-bold bg-transparent text-slate-100 outline-none cursor-pointer"
-                  value={historicalMonth ?? 1}
+                  aria-label="Weather data mode"
+                  className="text-[11px] font-bold bg-transparent text-slate-100 outline-none cursor-pointer"
+                  value={historicalYear ?? 'live'}
                   onChange={(e) => {
-                  setHistoricalMonth(Number(e.target.value));
-                  setHistoricalDay(1);
-                }}
+                    const v = e.target.value;
+                    handleHistoricalYear(v === 'live' ? null : Number(v));
+                  }}
                 >
-                  {Array.from({ length: historicalMonthsFor(historicalYear!) }, (_, i) => i + 1).map((m) => (
-                    <option key={m} value={m}>
-                      {new Date(0, m - 1, 1).toLocaleString('en-IN', { month: 'short' }).toLowerCase()}
+                  <option value="live">Live (today)</option>
+                  {yearAvail.map((a) => (
+                    <option key={a.year} value={a.year}>
+                      {a.label} · through {String(a.completed_through_month).padStart(2, '0')}
                     </option>
                   ))}
                 </select>
+                {isHistorical && historicalYear != null && (
+                  <select
+                    aria-label="Historical month"
+                    className="text-[11px] font-bold bg-transparent text-slate-100 outline-none cursor-pointer"
+                    value={historicalMonth ?? 1}
+                    onChange={(e) => {
+                      setHistoricalMonth(Number(e.target.value));
+                      setHistoricalDay(1);
+                    }}
+                  >
+                    {Array.from({ length: historicalMonthsFor(historicalYear) }, (_, i) => i + 1).map((m) => (
+                      <option key={m} value={m}>
+                        {new Date(0, m - 1, 1).toLocaleString('en-IN', { month: 'short' }).toLowerCase()}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+
+              {isHistorical && (
+                <span
+                  className="text-[10px] font-bold tracking-wide text-violet-100 bg-violet-950/70 border border-violet-500/50 rounded-full px-2 py-1"
+                  id="weather-not-live"
+                >
+                  NOT LIVE
+                </span>
+              )}
+
+              {isHistorical && historicalYear != null && historicalMonth != null && historicalBarOpen && (
+                <p className="text-[10px] text-slate-500" id="weather-historical-caption">
+                  {completedPeriodCaption(yearAvail, historicalYear)} · completed months only · NOT LIVE
+                </p>
+              )}
+            </div>
+
+            {isHistorical && historicalYear != null && historicalMonth != null && historicalBarOpen && (
+              <div id="weather-historical-panel" className="mt-2 space-y-2">
+                <MonthTimeline
+                  year={historicalYear}
+                  completed={completedMonthsFor(yearAvail, historicalYear)}
+                  selected={historicalMonth}
+                  onSelect={(m) => {
+                    setHistoricalMonth(m);
+                    setHistoricalDay(1);
+                  }}
+                />
+                <DateControl
+                  mode={dayMode}
+                  year={historicalYear}
+                  month={historicalMonth}
+                  day={historicalDay}
+                  onModeChange={setDayMode}
+                  onDayChange={setHistoricalDay}
+                />
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ---------- Row 3: Layers ---------- */}
+        <div id="weather-hazard-layers" className="px-3 py-2">
+          <div className="flex items-center justify-between gap-2">
+            <button
+              type="button"
+              id="weather-hazard-layers-toggle"
+              onClick={() => setLayersOpen((o) => !o)}
+              aria-expanded={layersOpen}
+              aria-controls="weather-hazard-layers-body"
+              className="flex min-h-10 items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-200"
+            >
+              <Layers className="w-3.5 h-3.5 text-sky-400" /> Layers
+              {layersOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
+            </button>
+            <button
+              type="button"
+              onClick={resetFeed}
+              title="Reset to temperature"
+              aria-label="Reset layers to temperature"
+              className="flex min-h-10 min-w-10 items-center justify-center text-slate-500 hover:text-sky-300"
+            >
+              <MapIcon className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {layersOpen && (
+            <div id="weather-hazard-layers-body" className="mt-2 space-y-2.5">
+              {/* Raster opacity — lets the user dial the forecast wash back so the
+                  street map reads clearly underneath. */}
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[9px] font-bold uppercase tracking-wide text-slate-500">Overlay</span>
+                {RASTER_OPACITY_PRESETS.map((p) => (
+                  <button
+                    key={p.id}
+                    type="button"
+                    id={`weather-raster-opacity-${p.id}`}
+                    onClick={() => setRasterOpacity(p.id)}
+                    aria-pressed={rasterOpacity === p.id}
+                    className={`min-h-9 rounded-md border px-2 py-1 text-[10px] font-bold transition ${
+                      rasterOpacity === p.id
+                        ? 'border-sky-500 bg-sky-600 text-white'
+                        : 'border-slate-700 bg-slate-900/60 text-slate-300 hover:border-slate-500 hover:text-white'
+                    }`}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Category tabs */}
+              <div className="flex flex-wrap gap-1">
+                {(['weather', 'hazards'] as const).map((c) => (
+                  <button
+                    key={c}
+                    type="button"
+                    id={`weather-hazard-category-${c}`}
+                    onClick={() => setCategory(c)}
+                    aria-pressed={category === c}
+                    className={`min-h-9 flex-1 rounded-md border px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition ${
+                      category === c ? 'bg-sky-600 border-sky-500 text-white' : 'bg-slate-900 border-slate-700 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {c}
+                  </button>
+                ))}
+              </div>
+
+              {/* Weather list */}
+              {category === 'weather' && (
+                <div className="grid grid-cols-2 gap-1 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+                  {WEATHER_LAYER_ORDER.map((id) => {
+                    const m = WEATHER_LAYERS[id];
+                    const active = feed.kind === 'weather' && feed.variable === id && !hazard;
+                    const unavailable = isHistorical && !isHistoricalVariableAvailable(id, dayMode === 'daily');
+                    const disabled = unavailable || Boolean(m.currentOnly && effectiveHour !== 0);
+                    return (
+                      <button
+                        key={id}
+                        type="button"
+                        id={`weather-hazard-layer-${id}`}
+                        disabled={disabled}
+                        onClick={() => handleWeatherVariable(id)}
+                        className={`min-h-10 text-left text-[10px] px-2 py-1.5 rounded-md border transition flex items-center justify-between gap-1 ${
+                          active
+                            ? 'bg-sky-600 text-white border-sky-500 font-bold'
+                            : disabled
+                              ? 'bg-slate-900 text-slate-600 border-slate-800 cursor-not-allowed'
+                              : 'bg-slate-900/60 text-slate-300 border-slate-800 hover:border-slate-600 hover:text-white'
+                        }`}
+                        title={
+                          unavailable
+                            ? dayMode === 'daily'
+                              ? `${m.label} is not exposed by the ERA5 daily archive — honestly unavailable, never substituted.`
+                              : `${m.label} is archived per-day only — switch to Daily view to play it back.`
+                            : disabled
+                              ? 'Current conditions only (Now)'
+                              : m.label
+                        }
+                      >
+                        <span className="truncate">{m.label}</span>
+                        <span className={`text-[8px] font-semibold shrink-0 ${active ? 'text-sky-100' : 'text-slate-500'}`}>
+                          {unavailable ? '—' : m.unit}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Hazards list */}
+              {category === 'hazards' && (
+                <div className="grid gap-1 sm:grid-cols-2 lg:grid-cols-3">
+                  {HAZARD_LAYERS.map((h) => {
+                    const active = feed.kind === 'flood'
+                      ? h.kind === 'computed'
+                      : feed.kind === 'weather' && h.gridVariable === feed.variable && Boolean(hazard);
+                    return (
+                      <button
+                        key={h.id}
+                        type="button"
+                        id={`weather-hazard-layer-${h.id}`}
+                        onClick={() => {
+                          if (h.kind === 'computed') {
+                            handleHazard({ kind: 'flood' });
+                          } else if (h.gridVariable) {
+                            setHazard({ kind: 'weather', variable: h.gridVariable });
+                            setCategory('hazards');
+                          }
+                        }}
+                        className={`min-h-10 text-left px-2 py-1.5 rounded-md border transition ${
+                          active ? 'bg-rose-600 text-white border-rose-500' : 'bg-slate-900/60 text-slate-300 border-slate-800 hover:border-rose-500/60'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="text-[10px] font-bold">{h.label}</span>
+                          {h.kind === 'computed' && <Waves className="w-3 h-3 text-rose-400" />}
+                        </div>
+                        <p className="text-[8px] text-slate-400 leading-tight mt-0.5">
+                          {h.kind === 'computed' && isHistorical
+                            ? `Rule-based from ERA5 ${monthPeriodLabel(historicalYear!, historicalMonth!)} + SRTM terrain`
+                            : h.description}
+                        </p>
+                      </button>
+                    );
+                  })}
+                </div>
               )}
             </div>
           )}
+        </div>
+      </div>
 
-          {/* Weather settings gear */}
-          <button
-            type="button"
-            onClick={() => setSettingsOpen((s) => !s)}
-            id="weather-settings-btn"
-            aria-label="Weather settings"
-            title="Weather settings"
-            className="pointer-events-auto inline-flex items-center gap-1.5 rounded-xl border border-slate-700/80 bg-slate-950/80 px-2.5 py-1.5 text-slate-300 hover:text-white hover:border-slate-500"
-          >
-            <SlidersHorizontal className="w-3.5 h-3.5" />
-            <span className="text-[10px] font-bold hidden sm:inline">Settings</span>
-          </button>
+      {/* =================================================================
+          Map — an explicit, usable height rather than a flex share.
+          `flex-1 min-h-0` here collapsed to zero: the control stack above is
+          `shrink-0`, so with Layers expanded there was no free space left and
+          the root's `overflow-hidden` then clipped what remained. A defined
+          height keeps the map at full size, and because the page is no longer
+          height-locked, `<main>` scrolls down to reach it.
+          `overflow-hidden` is kept here ONLY to clip the Leaflet canvas to the
+          rounded map boundary — this element does not scroll.
+          ================================================================= */}
+      <div className="relative h-[420px] sm:h-[480px] lg:h-[560px] shrink-0 overflow-hidden">
+      <div ref={containerRef} id="weather-hazard-map-canvas" className="absolute inset-0 z-0" />
 
-          <WeatherSettingsPanel
-            open={settingsOpen}
-            source={dataSource}
-            onSourceChange={setDataSource}
-            onClose={() => setSettingsOpen(false)}
-            canManageLiveProviders={canManageLiveProviders}
-          />
-
-          {/* Search */}
-          <div className="pointer-events-auto relative flex-1 max-w-xs min-w-[160px]">
+      {/* ------------ Map toolbar (search, settings, locate, fullscreen, basemap) ------------ */}
+      <div className="absolute top-0 left-0 right-0 z-30 pointer-events-none">
+        <div className="m-2 flex items-center gap-2">
+          <div className="pointer-events-auto relative min-w-0 flex-1 max-w-xs">
             {searchOpen ? (
               <div className="bg-slate-950/85 backdrop-blur-md border border-slate-700/80 rounded-xl overflow-hidden">
                 <div className="flex items-center gap-2 px-2.5 py-1.5">
@@ -995,10 +1246,10 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
                     autoFocus
                     className="bg-transparent text-xs text-slate-100 placeholder:text-slate-500 outline-none w-full"
                   />
-                  <button type="button" onClick={runSearch} className="text-slate-400 hover:text-slate-100">
+                  <button type="button" onClick={runSearch} className="text-slate-400 hover:text-slate-100" aria-label="Search">
                     <Search className="w-3.5 h-3.5" />
                   </button>
-                  <button type="button" onClick={() => setSearchOpen(false)} className="text-slate-500 hover:text-slate-200">
+                  <button type="button" onClick={() => setSearchOpen(false)} aria-label="Close search" className="text-slate-500 hover:text-slate-200">
                     <X className="w-3.5 h-3.5" />
                   </button>
                 </div>
@@ -1028,7 +1279,7 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
                 id="weather-map-search-toggle"
                 type="button"
                 onClick={() => setSearchOpen(true)}
-                className="bg-slate-950/80 backdrop-blur-md border border-slate-700/80 rounded-xl px-3 py-1.5 flex items-center gap-2 text-slate-300 hover:border-slate-500"
+                className="bg-slate-950/80 backdrop-blur-md border border-slate-700/80 rounded-xl px-3 py-1.5 min-h-10 flex items-center gap-2 text-slate-300 hover:border-slate-500"
               >
                 <Search className="w-3.5 h-3.5" />
                 <span className="text-[11px]">Search place…</span>
@@ -1037,18 +1288,41 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
           </div>
 
           <div className="pointer-events-auto ml-auto flex items-center gap-1.5">
-            <button type="button" onClick={locateMe} title="Use my location" className="icon-btn">
+            <button
+              type="button"
+              onClick={() => setSettingsOpen((s) => !s)}
+              id="weather-settings-btn"
+              aria-label="Weather settings"
+              title="Weather settings"
+              className="inline-flex min-h-10 items-center gap-1.5 rounded-xl border border-slate-700/80 bg-slate-950/80 px-2.5 py-1.5 text-slate-300 hover:text-white hover:border-slate-500"
+            >
+              <SlidersHorizontal className="w-3.5 h-3.5" />
+              <span className="text-[10px] font-bold hidden sm:inline">Settings</span>
+            </button>
+            <WeatherSettingsPanel
+              open={settingsOpen}
+              source={dataSource}
+              onSourceChange={setDataSource}
+              onClose={() => setSettingsOpen(false)}
+              canManageLiveProviders={canManageLiveProviders}
+            />
+            <button type="button" onClick={locateMe} title="Use my location" aria-label="Use my location" className="icon-btn">
               <LocateFixed className="w-4 h-4" />
             </button>
-            <button type="button" onClick={toggleFullscreen} title="Fullscreen" className="icon-btn">
+            <button type="button" onClick={resetView} title="Reset map view" aria-label="Reset map view" className="icon-btn">
+              <RotateCcw className="w-4 h-4" />
+            </button>
+            <button type="button" onClick={toggleFullscreen} title="Fullscreen" aria-label="Fullscreen" className="icon-btn">
               <Expand className="w-4 h-4" />
             </button>
-            {(['dark', 'street', 'satellite'] as const).map((b) => (
+            {(['street'] as const).map((b) => (
               <button
                 key={b}
                 type="button"
+                id={`weather-basemap-${b}`}
                 onClick={() => setBasemap(b)}
-                className={`text-[10px] font-bold uppercase tracking-wide px-2.5 py-1.5 rounded-lg border transition ${
+                aria-pressed={basemap === b}
+                className={`min-h-10 px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wide rounded-lg border transition ${
                   basemap === b
                     ? 'bg-sky-600 text-white border-sky-500'
                     : 'bg-slate-950/75 text-slate-300 border-slate-700/80 hover:border-slate-500'
@@ -1061,9 +1335,9 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
         </div>
       </div>
 
-      {/* Wind particles toggle + controls (top-right below basemap) — live, and historical per-day playback */}
+      {/* Wind particles toggle + controls — live, and historical per-day playback */}
       {(!isHistorical || dayMode === 'daily') && feed.kind === 'weather' && feed.variable === WIND_LAYER && (
-        <div className="absolute top-14 right-[220px] z-40 pointer-events-auto flex flex-col items-start gap-1.5">
+        <div className="absolute top-14 right-3 z-40 pointer-events-auto flex flex-col items-start gap-1.5">
           <div className="bg-slate-950/80 backdrop-blur-md border border-slate-700/80 rounded-xl p-1.5 flex items-center gap-1">
             <button
               type="button"
@@ -1077,7 +1351,7 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
             </button>
             {windOn && windLayerRef.current && (
               <>
-                <button type="button" onClick={() => (windLayerRef.current!.isRunning() ? windLayerRef.current!.pause() : windLayerRef.current!.resume())} className="text-slate-300 hover:text-white p-1" title="Pause / play">
+                <button type="button" onClick={() => (windLayerRef.current!.isRunning() ? windLayerRef.current!.pause() : windLayerRef.current!.resume())} className="text-slate-300 hover:text-white p-1" title="Pause / play" aria-label="Pause or play wind particles">
                   {windLayerRef.current!.isRunning() ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
                 </button>
                 <button type="button" onClick={() => { if (windLayerRef.current) windLayerRef.current.setSpeed(0.5); }} className="factor-btn" title="Slow">½×</button>
@@ -1088,231 +1362,6 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
           </div>
         </div>
       )}
-
-      {/* ------------ Layer panel (right) ------------ */}
-      <div className="absolute top-16 bottom-20 right-3 z-30 pointer-events-auto w-[208px] flex flex-col gap-2">
-        <div className="bg-slate-950/85 backdrop-blur-md border border-slate-700/80 rounded-xl shadow-xl overflow-hidden">
-          <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800">
-            <button
-              type="button"
-              onClick={() => setLayersOpen((o) => !o)}
-              className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-200"
-            >
-              <Layers className="w-3.5 h-3.5 text-sky-400" /> Layers
-              {layersOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
-            </button>
-            <button type="button" onClick={resetFeed} title="Reset to temperature" className="text-slate-500 hover:text-sky-300">
-              <MapIcon className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          {layersOpen && (
-            <div className="p-2 space-y-2.5 max-h-[44vh] overflow-y-auto">
-              {/* Category tabs */}
-              <div className="grid grid-cols-2 gap-1">
-                {(['weather', 'hazards'] as const).map((c) => (
-                  <button
-                    key={c}
-                    type="button"
-                    onClick={() => setCategory(c)}
-                    className={`text-[9px] font-bold uppercase tracking-wide py-1 rounded-md border ${
-                      category === c ? 'bg-sky-600 border-sky-500 text-white' : 'bg-slate-900 border-slate-700 text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    {c}
-                  </button>
-                ))}
-              </div>
-
-              {/* Weather list */}
-              {category === 'weather' && (
-                <div className="space-y-1">
-                  {WEATHER_LAYER_ORDER.map((id) => {
-                    const m = WEATHER_LAYERS[id];
-                    const active = feed.kind === 'weather' && feed.variable === id && !hazard;
-                    const unavailable = isHistorical && !isHistoricalVariableAvailable(id, dayMode === 'daily');
-                    const disabled = unavailable || Boolean(m.currentOnly && effectiveHour !== 0);
-                    return (
-                      <button
-                        key={id}
-                        type="button"
-                        id={`weather-hazard-layer-${id}`}
-                        disabled={disabled}
-                        onClick={() => handleWeatherVariable(id)}
-                        className={`w-full text-left text-[10px] px-2 py-1 rounded-md border transition flex items-center justify-between gap-1 ${
-                          active
-                            ? 'bg-sky-600 text-white border-sky-500 font-bold'
-                            : disabled
-                              ? 'bg-slate-900 text-slate-600 border-slate-800 cursor-not-allowed'
-                              : 'bg-slate-900/60 text-slate-300 border-slate-800 hover:border-slate-600 hover:text-white'
-                        }`}
-                        title={
-                          unavailable
-                            ? dayMode === 'daily'
-                              ? `${m.label} is not exposed by the ERA5 daily archive — honestly unavailable, never substituted.`
-                              : `${m.label} is archived per-day only — switch to Daily view to play it back.`
-                            : disabled
-                              ? 'Current conditions only (Now)'
-                              : m.label
-                        }
-                      >
-                        <span className="truncate">{m.label}</span>
-                        <span className={`text-[8px] font-semibold shrink-0 ${active ? 'text-sky-100' : 'text-slate-500'}`}>
-                          {unavailable ? '—' : m.unit}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-
-              {/* Hazards list */}
-              {category === 'hazards' && (
-                <div className="space-y-1">
-                  {HAZARD_LAYERS.map((h) => {
-                    const active = feed.kind === 'flood'
-                      ? h.kind === 'computed'
-                      : feed.kind === 'weather' && h.gridVariable === feed.variable && Boolean(hazard);
-                    return (
-                      <button
-                        key={h.id}
-                        type="button"
-                        id={`weather-hazard-layer-${h.id}`}
-                        onClick={() => {
-                          if (h.kind === 'computed') {
-                            handleHazard({ kind: 'flood' });
-                          } else if (h.gridVariable) {
-                            setHazard({ kind: 'weather', variable: h.gridVariable });
-                            setCategory('hazards');
-                          }
-                        }}
-                        className={`w-full text-left px-2 py-1.5 rounded-md border transition ${
-                          active ? 'bg-rose-600 text-white border-rose-500' : 'bg-slate-900/60 text-slate-300 border-slate-800 hover:border-rose-500/60'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-1">
-                          <span className="text-[10px] font-bold">{h.label}</span>
-                          {h.kind === 'computed' && <Waves className="w-3 h-3 text-rose-400" />}
-                        </div>
-                        <p className="text-[8px] text-slate-400 leading-tight mt-0.5">
-                          {h.kind === 'computed' && isHistorical
-                            ? `Rule-based from ERA5 ${monthPeriodLabel(historicalYear!, historicalMonth!)} + SRTM terrain`
-                            : h.description}
-                        </p>
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-
-        {/* Sources / provenance */}
-        <div className="bg-slate-950/85 backdrop-blur-md border border-slate-700/80 rounded-xl shadow-xl overflow-hidden">
-          <button
-            type="button"
-            id="weather-hazard-sources"
-            onClick={() => setSourcesOpen((o) => !o)}
-            className="w-full flex items-center justify-between px-3 py-2 text-[11px] font-bold uppercase tracking-wider text-slate-200"
-          >
-            Sources & provenance
-            {sourcesOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
-          </button>
-          {sourcesOpen && (
-            <div className="px-3 pb-3 pt-0 space-y-1.5 text-[10px] leading-relaxed text-slate-400 border-t border-slate-800 max-h-[26vh] overflow-y-auto">
-              {feed.kind === 'weather' && grid && (
-                <>
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <StatusChip status={grid.data_status} />
-                    {isHistorical && grid.data_status !== 'UNAVAILABLE' && (
-                      <span className="text-violet-300 font-bold text-[9px]">ERA5 REANALYSIS</span>
-                    )}
-                    {grid.provider_role === 'backup' && <span className="text-amber-400 font-bold text-[9px]">ECMWF BACKUP</span>}
-                    {grid.provider_role === 'primary' && <span className="text-emerald-400 font-bold text-[9px]">PRIMARY</span>}
-                  </div>
-                  <p>Provider: <b className="text-slate-200">{grid.provider ?? '—'}</b></p>
-                  <p>Source: <b className="text-slate-200">{grid.data_source}</b></p>
-                  {grid.model && <p>Model: <b className="text-slate-200">{grid.model}</b></p>}
-                  {isHistorical && (
-                    <>
-                      <p>
-                        Period: <b className="text-violet-200">
-                          {dayMode === 'daily'
-                            ? `Day ${historicalDay} · ${fmtDateLabel(historicalYear!, historicalMonth!, historicalDay)}`
-                            : `${monthPeriodLabel(historicalYear!, historicalMonth!)} (completed month, archived)`}
-                        </b>
-                      </p>
-                      {grid.data_provenance?.source && (
-                        <p className="text-[9px] text-slate-500">Provenance: {grid.data_provenance.source}</p>
-                      )}
-                    </>
-                  )}
-                  {grid.valid_time && <p>Valid: <b className="text-slate-200">{grid.valid_time}</b></p>}
-                  {grid.bounds && (
-                    <p>
-                      Bounds: <b className="text-slate-200">{grid.bounds.south.toFixed(2)}°S–{grid.bounds.north.toFixed(2)}°N, {grid.bounds.west.toFixed(2)}°W–{grid.bounds.east.toFixed(2)}°E</b>
-                    </p>
-                  )}
-                  {grid.steps?.latitude && <p>Grid: ~{grid.steps.latitude.toFixed(2)}° cells, {grid.points.length} cells</p>}
-                  <p>
-                    {isHistorical
-                      ? dayMode === 'daily'
-                        ? `Day ${historicalDay} · ${fmtDateLabel(historicalYear!, historicalMonth!, historicalDay)}`
-                          + (grid.data_provenance?.aggregation ? ` · ${grid.data_provenance.aggregation}` : ' · per-day value')
-                        : `${monthPeriodLabel(historicalYear!, historicalMonth!)} monthly aggregate`
-                      : `${grid.day === 0 ? 'Now' : `Day ${grid.day}`}${grid.hour != null ? ` · +${grid.hour}h` : ''}`}
-                    {' · unit '}{grid.unit ?? '—'}
-                  </p>
-                  {grid.points.some((p) => p.value != null) && grid.min != null && grid.max != null && (
-                    <p>
-                      Range: <b className="text-slate-200">{grid.min.toFixed(1)}–{grid.max.toFixed(1)} {grid.unit}</b>
-                    </p>
-                  )}
-                  {grid.derived && <p className="text-amber-300">Derived from speed + direction (u/v), never fabricated.</p>}
-                  {isHistorical && grid.data_status === 'UNAVAILABLE' && (
-                    <p className="text-rose-400">This variable is not exposed by the ERA5 daily archive — reported honestly, never substituted.</p>
-                  )}
-                </>
-              )}
-              {feed.kind === 'flood' && floodGrid && (
-                <>
-                  <p>Status: <StatusChip status={floodGrid.data_status} /></p>
-                  <p className="text-amber-300">Transparent rule-based overlay (CALCULATED).</p>
-                  <p>Source: {floodGrid.data_source}</p>
-                  {isHistorical && (
-                    <p>
-                      Period: <b className="text-violet-200">{monthPeriodLabel(historicalYear!, historicalMonth!)} (ERA5 + SRTM)</b>
-                    </p>
-                  )}
-                  {floodGrid.weights && (
-                    <p>
-                      Weights: {Object.entries(floodGrid.weights)
-                        .map(([k, w]) => `${k.replace(/_/g, ' ')} ${(Number(w) * 100).toFixed(0)}%`)
-                        .join(' · ')}
-                    </p>
-                  )}
-                </>
-              )}
-              {windActive && windField && (
-                <p className="text-sky-300">Wind particles: {windField.source}</p>
-              )}
-              {grid?.reason && <p className="text-rose-400">{grid.reason}</p>}
-              {floodGrid?.reason && <p className="text-rose-400">{floodGrid.reason}</p>}
-              {feed.kind === 'weather' && !isHistorical && (
-                <p className="pt-1 text-slate-500">Timeline: Now + hourly {HOURLY_MAX}h forecast. Open-Meteo/ECMWF chain, prefer=ecmwf.</p>
-              )}
-              {feed.kind === 'weather' && isHistorical && (
-                <p className="pt-1 text-slate-500">
-                  Historical mode: {dayMode === 'daily'
-                    ? `per-day playback for ${fmtDateLabel(historicalYear!, historicalMonth!, historicalDay)}`
-                    : `monthly aggregates`} from the Open-Meteo ERA5 archive (completed months only, never invented).
-                </p>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
 
       {/* ------------ Legend (bottom-right) ------------ */}
       <WeatherLegend
@@ -1369,11 +1418,24 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
       )}
 
       {/* ------------ Pick tool ------------ */}
+      {/* Bottom-left, clear of the wind toggle (top-right), the legend
+          (bottom-right) and the live timeline (bottom, live mode only). The
+          historical control is no longer a map overlay, so it cannot collide. */}
       {picker && (
-        <div className="absolute bottom-24 left-3 z-30 pointer-events-auto bg-slate-950/85 backdrop-blur-md border border-slate-700/80 rounded-xl shadow-2xl p-3 w-64 max-w-[calc(100%-8px)]">
+        <div
+          className={`absolute left-3 z-30 pointer-events-auto bg-slate-950/85 backdrop-blur-md border border-slate-700/80 rounded-xl shadow-2xl p-3 w-64 max-w-[calc(100%-1.5rem)] max-h-[calc(100%-8rem)] overflow-y-auto ${
+            isHistorical ? 'bottom-3' : 'bottom-24'
+          }`}
+        >
           <div className="flex items-start justify-between gap-2">
             <p className="text-[10px] font-bold uppercase tracking-wide text-sky-400">Point picker</p>
-            <button type="button" onClick={() => setPicker(null)} className="text-slate-500 hover:text-white">
+            <button
+              type="button"
+              onClick={() => setPicker(null)}
+              aria-label="Close point picker"
+              title="Close point picker"
+              className="flex min-h-10 min-w-10 items-center justify-center -mt-2 -mr-2 text-slate-500 hover:text-white"
+            >
               <X className="w-3.5 h-3.5" />
             </button>
           </div>
@@ -1466,50 +1528,13 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
           </div>
         </div>
       )}
-
-      {/* Historical-mode bottom bar: month timeline + date control */}
-      {isHistorical && historicalYear != null && historicalMonth != null && (
-        <div className="absolute bottom-0 left-0 right-0 z-30 pointer-events-none px-2 sm:px-3 pb-2">
-          <div className="pointer-events-auto bg-slate-950/85 backdrop-blur-md border border-violet-800/50 rounded-xl px-3 py-2 shadow-2xl space-y-1.5">
-            <div className="flex items-center justify-between gap-2 flex-wrap">
-              <p className="text-[9px] text-violet-300/90 flex items-center gap-1.5">
-                <CalendarDays className="w-3 h-3" />
-                Historical: real ERA5 reanalysis — completed months only, never invented. Monthly shows the month's aggregate; Daily plays back that single day's grid (wind particles available per day).
-              </p>
-              <span
-                className="text-[9px] font-bold tracking-wide text-violet-100 bg-violet-950/70 border border-violet-500/50 rounded-full px-2 py-0.5"
-                id="weather-not-live"
-              >
-                NOT LIVE
-              </span>
-            </div>
-            <MonthTimeline
-              year={historicalYear}
-              completed={completedMonthsFor(yearAvail, historicalYear)}
-              selected={historicalMonth}
-              onSelect={(m) => {
-                setHistoricalMonth(m);
-                setHistoricalDay(1);
-              }}
-            />
-            <DateControl
-              mode={dayMode}
-              year={historicalYear}
-              month={historicalMonth}
-              day={historicalDay}
-              onModeChange={setDayMode}
-              onDayChange={setHistoricalDay}
-            />
-            <p className="text-[9px] text-slate-500" id="weather-historical-caption">
-              {completedPeriodCaption(yearAvail, historicalYear)} · Historical / completed months only · NOT LIVE
-            </p>
-          </div>
-        </div>
-      )}
+      </div>
 
       {/* global css for map internals */}
       <style>{`
         .icon-btn{
+          display:inline-flex; align-items:center; justify-content:center;
+          min-height:2.5rem; min-width:2.5rem;
           background: rgba(2,6,23,0.8);
           border: 1px solid rgba(51,65,85,0.8);
           border-radius: 0.65rem;
@@ -1518,7 +1543,8 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
         }
         .icon-btn:hover{ border-color: rgb(100 116 139); color: #fff; }
         .tl-btn{
-          display:inline-flex; align-items:center; gap:0.3rem;
+          display:inline-flex; align-items:center; justify-content:center; gap:0.3rem;
+          min-height:2.5rem;
           font-size:10px; font-weight:700; letter-spacing:0.05em;
           padding:0.35rem 0.55rem; border-radius:0.5rem;
           background: rgb(2 6 23 / 0.6); border:1px solid rgb(51 65 85);
@@ -1526,6 +1552,8 @@ export const WeatherMap: React.FC<WeatherMapProps> = ({
         }
         .tl-btn:hover{ border-color: rgb(148 163 184); }
         .factor-btn{
+          display:inline-flex; align-items:center; justify-content:center;
+          min-height:2.5rem; min-width:2.5rem;
           font-size:9px; font-weight:700; padding:0.25rem 0.4rem; border-radius:0.4rem;
           background: rgb(2 6 23 / 0.6); border:1px solid rgb(51 65 85); color: rgb(148 163 184);
         }
@@ -1683,13 +1711,6 @@ function HistoricalPointPanel({ weather, dayMode, year, month, day }: Historical
         </>
       )}
     </div>
-  );
-}
-
-function escapeHtml(value: string | number | null | undefined): string {
-  return String(value ?? '').replace(
-    /[&<>"']/g,
-    (c) => (({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }) as Record<string, string>)[c]
   );
 }
 

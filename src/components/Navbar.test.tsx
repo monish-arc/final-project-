@@ -41,7 +41,7 @@ describe('Navbar persona switcher gating', () => {
       <Navbar {...baseProps} currentUser={citizen!} enableTestPersonaSwitcher onSignOut={() => {}} />
     );
     expect(html).not.toContain('role-switcher-dropdown-btn');
-    expect(html).not.toContain('sign-out-btn');
+    expect(html).toContain('sign-out-btn');
     expect(html).toContain(citizen!.full_name);
   });
 });

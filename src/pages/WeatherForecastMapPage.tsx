@@ -28,7 +28,14 @@ export const WeatherForecastMapPage: React.FC<WeatherForecastMapPageProps> = ({
 }) => {
   void dataStatus;
   return (
-    <div id="weather-hazard-map-view" className="relative h-[calc(100dvh-9.5rem)] min-h-[560px]">
+    // `flex-none` (`flex: 0 0 auto`) is the critical part: `<main>` is a column
+    // flexbox, so a `flex-1` child would be sized by flex distribution
+    // (`flex-basis: 0` applies to HEIGHT here) instead of by its content. That
+    // kept the page exactly as tall as the viewport, so `<main>`'s
+    // `overflow-y-auto` had no overflow to scroll to and the map below the
+    // Layers panel was unreachable. With `flex-none` the page keeps its natural
+    // content height, which overflows `<main>` and makes it scrollable.
+    <div id="weather-hazard-map-view" className="flex flex-col flex-none">
       <WeatherMap
         focus={focus}
         regionLabel={regionLabel}

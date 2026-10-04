@@ -143,40 +143,40 @@ export const LeafletMap: React.FC<LeafletMapProps> = ({
     const el = gisMapComponentRef.current;
     if (!el) return;
     if (fullscreen) {
-      if (document.fullscreenElement && document.exitFullscreen) {
-        document.exitFullscreen().catch(() => setFullscreen(false));
-      } else {
-        setFullscreen(false);
+      if (document.exitFullscreen) {
+        document.exitFullscreen().catch(() => undefined);
       }
+      setFullscreen(false);
       return;
     }
     const elAny = el as HTMLDivElement & {
       requestFullscreen?: () => Promise<void> | void;
       webkitRequestFullscreen?: () => Promise<void> | void;
     };
-    if (typeof document.documentElement.requestFullscreen === 'function') {
-      try {
-        const result = elAny.requestFullscreen?.();
-        if (result && typeof result.catch === 'function') {
-          result.catch(() => setFullscreen(true));
-        }
-      } catch {
-        setFullscreen(true);
+    const enterFullscreen = (result?: Promise<void> | void) => {
+      if (result && typeof result.then === 'function') {
+        result
+          .then(() => setFullscreen(Boolean(document.fullscreenElement)))
+          .catch(() => undefined);
+        return;
       }
-      window.setTimeout(() => {
-        if (!document.fullscreenElement) setFullscreen(true);
-      }, 350);
-    } else if (typeof elAny.webkitRequestFullscreen === 'function') {
+      setFullscreen(Boolean(document.fullscreenElement));
+    };
+    if (typeof elAny.requestFullscreen === 'function') {
+      try {
+        enterFullscreen(elAny.requestFullscreen());
+      } catch {
+        /* fullscreen unavailable — stay in embedded mode */
+      }
+      return;
+    }
+    if (typeof elAny.webkitRequestFullscreen === 'function') {
       try {
         elAny.webkitRequestFullscreen();
-      } catch {
         setFullscreen(true);
+      } catch {
+        /* fullscreen unavailable — stay in embedded mode */
       }
-      window.setTimeout(() => {
-        if (!document.fullscreenElement) setFullscreen(true);
-      }, 350);
-    } else {
-      setFullscreen(true);
     }
   };
 
@@ -1107,7 +1107,7 @@ export const LeafletMap: React.FC<LeafletMapProps> = ({
     <div
       ref={gisMapComponentRef}
       id="gis-map-component"
-      className={`relative w-full h-full min-h-[420px] lg:min-h-[550px] rounded-xl overflow-hidden border border-sm-border shadow-inner ${
+      className={`relative isolate w-full h-full min-h-[420px] lg:min-h-[550px] rounded-xl overflow-hidden border border-sm-border shadow-inner ${
         fullscreen ? 'gis-map-fullscreen' : ''
       }`}
     >

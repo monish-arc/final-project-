@@ -36,6 +36,7 @@ export type NavTab =
   | 'evacuation'
   | 'field_reports'
   | 'directive'
+  | 'data_sources'
   | 'admin'
   | 'docs';
 
@@ -112,6 +113,16 @@ export const NAV_ITEMS: NavItem[] = [
     label: 'Directive Brief',
     icon: BookOpen,
     roles: ['sub_district_officer', 'district_officer', 'state_officer', 'admin'],
+  },
+  {
+    // Source/data-status dashboard. Operational roles only — a normal citizen has
+    // no operational need for provider configuration, and the requirement is
+    // that this stays hidden from them. Authorisation reuses the same
+    // `roles` + `getAccessibleTabs` model as every other tab; no new auth logic.
+    id: 'data_sources',
+    label: 'Data Sources',
+    icon: Database,
+    roles: ['sub_district_officer', 'district_officer', 'state_officer', 'gis_analysis_officer', 'admin'],
   },
   {
     id: 'admin',
