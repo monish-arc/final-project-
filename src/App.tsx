@@ -555,7 +555,6 @@ export default function App() {
                   onRefresh={() => fetchRegionData(selectedRegion)}
                   onRegionChange={handleRegionChange}
                   onSelectHabitation={(hab) => setModalHabitation(hab)}
-                  onSelectSite={(site) => setModalSite(site)}
                   onNavigateTab={(tab) => setActiveTab(tab)}
                   onOpenEvacuation={(hab) => handleOpenEvacuation(hab)}
                   onLocateOnMap={(focus) => handleExplicitFocus(focus)}

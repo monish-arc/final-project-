@@ -35,7 +35,6 @@ import {
 import { NavTab } from '../components/Sidebar';
 import { RegionViewportFocus } from '../lib/regionViewport';
 import { apiService } from '../services/api';
-import { LeafletMap } from '../components/LeafletMap';
 import { HistoricalBaselineCard } from '../components/HistoricalBaselineCard';
 import { DataStatusBadge } from '../components/DataStatusBadge';
 import { LocationControlBar } from '../components/commandcenter/LocationControlBar';
@@ -71,7 +70,6 @@ interface DashboardPageProps {
   onRefresh: () => void;
   onRegionChange: (region: RegionSelection) => void;
   onSelectHabitation: (hab: Habitation) => void;
-  onSelectSite: (site: RelocationSite) => void;
   onNavigateTab: (tab: NavTab) => void;
   onOpenEvacuation: (hab: Habitation) => void;
   onLocateOnMap: (focus: RegionViewportFocus) => void;
@@ -147,7 +145,6 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   onRefresh,
   onRegionChange,
   onSelectHabitation,
-  onSelectSite,
   onNavigateTab,
   onOpenEvacuation,
   onLocateOnMap,
@@ -325,49 +322,8 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       {/* Row 3: Risk summary */}
       <RiskSummaryRow summary={summary} regionLabel={regionTitle} />
 
-      {/* Row 4: Live map + alerts rail */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-        <div className="lg:col-span-2 bg-sm-panel border border-sm-border rounded-xl shadow p-3">
-          <div className="flex items-center justify-between px-1 pb-2">
-            <div>
-              <h3 className="text-xs font-bold uppercase tracking-wider text-sm-text">
-                Live Risk Map — {regionTitle}
-              </h3>
-              <p className="text-[10px] text-sm-muted">
-                Hazards · habitations · relocation sites · risk zones · Safer Route (engine-evaluated)
-              </p>
-            </div>
-            <span className="text-[10px] text-sm-muted">
-              {habitationsMeta?.data_status === 'UNAVAILABLE'
-                ? 'Habitations unavailable: ' + (habitationsMeta.reason ?? '')
-                : `${habitations.length} habitations from ${habitationsMeta?.data_source ?? '—'}`}
-            </span>
-          </div>
-          <LeafletMap
-            habitations={habitations}
-            relocationSites={relocationSites}
-            redZones={redZones}
-            infrastructure={infrastructure}
-            fieldReports={fieldReports}
-            disasterEvents={disasterEvents}
-            riskZones={riskZones}
-            rainfallGrid={rainfallGrid}
-            floodForecast={floodForecast}
-            dataStatus={dataStatus}
-            bhuvanRoute={bhuvanRoute}
-            safeRoute={safeRoute}
-            selectedHabitationId={anchorHab?.id}
-            focus={focusRegion}
-            onSelectHabitation={(hab) => setAnchor(hab)}
-            onSelectSite={onSelectSite}
-            historicalBaseline={historicalBaseline}
-            historicalSummaries={historicalSummaries}
-            historicalAvailability={historicalAvailability}
-            historicalDistrictId={historicalDistrictId}
-            onHistoricalDistrictChange={onHistoricalDistrictChange}
-          />
-        </div>
-
+      {/* Row 4: Alerts rail */}
+      <div className="grid grid-cols-1 gap-5">
         <div className="flex flex-col gap-4">
           <ActiveAlertsPanel
             riskAlerts={riskAlerts}
