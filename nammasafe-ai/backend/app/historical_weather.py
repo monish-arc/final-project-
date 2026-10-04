@@ -23,7 +23,15 @@ weather maps:
     precipitation probability) are marked `available: False` with a reason —
     never substituted.
   * The same rate-limit guards as the live chain (concurrency semaphore,
-    429 cooldown with Retry-After) keep the archive API from being hammered.
+    429 cooldown with Retry-After) keep the archive API from being hammered,
+    but the Weather Map grid and the Point Picker hold SEPARATE cooldown slots
+    (`HISTORICAL_GRID_SCOPE` / `HISTORICAL_POINT_SCOPE`). The grid fans out
+    into several multi-location chunks per viewport while a point click is one
+    single-cell request, so a throttled grid must never lock out the picker.
+  * Raw daily archive blocks are cached PER CELL, not per request. The same
+    cells are therefore reused across repeat requests, reordered coordinate
+    lists, changed viewports and different grid steps; only genuinely new cells
+    reach the upstream archive.
 
 Persistence: validated historical samples are cached to the
 `historical_weather_samples` table (rounded cell / year / month / variable /
@@ -39,8 +47,9 @@ import math
 import threading
 import time
 from calendar import monthrange
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +77,24 @@ from app.weather_service import (  # noqa: E402
 HISTORICAL_PROVIDER_NAME = "Open-Meteo ERA5 Archive"
 HISTORICAL_SOURCE = "Open-Meteo ERA5 Archive"
 HISTORICAL_DATASET = "ECMWF ERA5 reanalysis (0.25°, daily aggregations)"
+
+# ---------------------------------------------------------------------------
+# Independent rate-limit scopes for the archive.
+#
+# The Weather Map grid and the Point Picker have completely different upstream
+# footprints: a single viewport change fans out into several multi-location
+# chunks, while a point click is exactly ONE request for ONE cell. They used to
+# share one process-global cooldown slot, so a grid chunk being throttled locked
+# out the Point Picker for the whole cooldown window even though the point
+# request was perfectly valid.
+#
+# The existing shared cooldown guards are keyed by an arbitrary string, so the
+# scopes are just distinct keys on the same mechanism — no second provider, no
+# duplicated guard code, and the live/current weather chain is untouched (it
+# keeps using its own provider-name keys).
+# ---------------------------------------------------------------------------
+HISTORICAL_GRID_SCOPE = f"{HISTORICAL_PROVIDER_NAME}:grid"
+HISTORICAL_POINT_SCOPE = f"{HISTORICAL_PROVIDER_NAME}:point"
 
 _INCOMPLETE_MONTH_REASON = (
     "Month is not yet completed: historical ERA5 reanalysis is only served for "
@@ -164,6 +191,11 @@ _POINT_UNITS: Dict[str, str] = {
 }
 
 _THUNDERSTORM_CODES = {95, 96, 99}
+
+# Columns a cached per-cell daily block carries: the date axis plus every
+# requested daily column. `time` is the date axis, not a weather variable, so it
+# is not part of _DAILY_COLUMNS.
+_ARCHIVE_BLOCK_COLUMNS: Tuple[str, ...] = ("time",) + _DAILY_COLUMNS
 
 # Every variable a historical grid accepts (aggregated, per-day, honestly-unavailable).
 HISTORICAL_GRID_VARIABLES = sorted(
@@ -271,15 +303,39 @@ class HistoricalWeatherProvider:
             config.HISTORICAL_WEATHER_CACHE_TTL_SEC,
             max_entries=16384,
         )
-        self._block_cache = TTLCache(
+        # Raw daily archive blocks, cached PER CELL rather than per request.
+        # The old cache was keyed on the whole ordered coordinate list, so any
+        # reordering of the same cells, a slightly different viewport, or a
+        # different grid step produced a fresh miss and re-fetched cells that
+        # were already held. Keying per cell makes every already-fetched cell
+        # reusable regardless of order, viewport, or which grid layer asked.
+        self._archive_cell_cache = TTLCache(
             config.HISTORICAL_WEATHER_CACHE_TTL_SEC,
-            max_entries=256,
+            max_entries=8192,
         )
         self._point_cache = TTLCache(
             config.HISTORICAL_WEATHER_CACHE_TTL_SEC,
             max_entries=4096,
         )
         self._lock = threading.Lock()
+        # Which rate-limit scope the current call is running under. Thread-local
+        # so a concurrent grid request and point request never share a scope,
+        # and so the scope does not leak between requests on a worker thread.
+        self._scope_state = threading.local()
+
+    @property
+    def _default_scope(self) -> str:
+        return getattr(self._scope_state, "scope", HISTORICAL_GRID_SCOPE)
+
+    @contextmanager
+    def _scope(self, scope: str) -> Iterator[None]:
+        """Run the enclosed archive fetches under a specific cooldown scope."""
+        previous = getattr(self._scope_state, "scope", HISTORICAL_GRID_SCOPE)
+        self._scope_state.scope = scope
+        try:
+            yield
+        finally:
+            self._scope_state.scope = previous
 
     # ----------------------------- period bounds -----------------------------
 
@@ -298,10 +354,129 @@ class HistoricalWeatherProvider:
     # ------------------------------- network ---------------------------------
 
     @staticmethod
-    def _archive_cache_key(latitudes: List[float], longitudes: List[float], start: str, end: str) -> str:
-        lat_key = ",".join(str(_round6(lat)) for lat in latitudes)
-        lng_key = ",".join(str(_round6(lng)) for lng in longitudes)
-        return f"archive:{start}:{end}:{lat_key}|{lng_key}"
+    def _cell_pairs(latitudes: List[float], longitudes: List[float]) -> List[Tuple[str, str]]:
+        """Rounded (lat, lng) string pairs, in the caller's requested order."""
+        return [
+            (str(_round6(lat)), str(_round6(lng)))
+            for lat, lng in zip(latitudes, longitudes)
+        ]
+
+    @classmethod
+    def _archive_cache_key(
+        cls, latitudes: List[float], longitudes: List[float], start: str, end: str
+    ) -> str:
+        """Order-independent archive key.
+
+        The key is the *canonical set* of cells for the window, so the same
+        cells requested in a different order (the wind layer fans out two grid
+        calls, cell order follows the viewport walk) resolve to the same entry
+        instead of missing the cache and re-fetching every cell."""
+        canonical = ";".join(
+            sorted({f"{lat},{lng}" for lat, lng in cls._cell_pairs(latitudes, longitudes)})
+        )
+        return f"archive:{start}:{end}:{canonical}"
+
+    @staticmethod
+    def _archive_cell_cache_key(pair: Tuple[str, str], start: str, end: str) -> str:
+        return f"archive-cell:{start}:{end}:{pair[0]},{pair[1]}"
+
+    @staticmethod
+    def _canonical_pairs_key(pairs: List[Tuple[str, str]]) -> str:
+        return ";".join(sorted({f"{lat},{lng}" for lat, lng in pairs}))
+
+    @classmethod
+    def _cells_from_flat(
+        cls, pairs: List[Tuple[str, str]], daily: Dict[str, Any]
+    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Split an upstream flattened block into one per-cell entry each.
+
+        Every requested column is always present, length `days`; a column the
+        upstream did not return becomes explicit `None` so positional alignment
+        is preserved and no value is ever invented."""
+        times = daily.get("time") or []
+        days = len(times) // len(pairs) if pairs else 0
+        cells: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for index, pair in enumerate(pairs):
+            offset = index * days
+            entry: Dict[str, Any] = {}
+            for col in _ARCHIVE_BLOCK_COLUMNS:
+                values = daily.get(col)
+                if isinstance(values, list) and len(values) >= offset + days:
+                    entry[col] = list(values[offset : offset + days])
+                else:
+                    entry[col] = [None] * days
+            cells[pair] = entry
+        return cells
+
+    @classmethod
+    def _flat_from_cells(
+        cls, pairs: List[Tuple[str, str]], cells: Dict[Tuple[str, str], Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Re-assemble the positional flattened block for `pairs`, in order.
+
+        This is what makes the per-cell cache safe for the existing callers: the
+        return contract is unchanged (column arrays of length
+        len(latitudes) * days in request order), so `_aggregate_rows` and every
+        downstream index calculation behave exactly as before."""
+        if not pairs:
+            return {}
+        first = cells.get(pairs[0]) or {}
+        times = list(first.get("time") or [])
+        flat: Dict[str, Any] = {}
+        if times:
+            flat["time"] = []
+        for pair in pairs:
+            entry = cells.get(pair) or {}
+            if times and not entry.get("time"):
+                # Defensive: keep `time` aligned even if an entry lost it.
+                entry = dict(entry)
+                entry["time"] = [None] * len(times)
+            for col in _ARCHIVE_BLOCK_COLUMNS:
+                flat.setdefault(col, []).extend(entry.get(col) or [])
+        return flat
+
+    def _cached_archive_cells(
+        self, pairs: List[Tuple[str, str]], start: str, end: str
+    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Per-cell daily blocks already held for this window, in any order."""
+        out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for pair in dict.fromkeys(pairs):
+            entry = self._archive_cell_cache.get(
+                self._archive_cell_cache_key(pair, start, end)
+            )
+            if isinstance(entry, dict) and entry:
+                out[pair] = entry
+        return out
+
+    def _store_archive_cells(
+        self,
+        cells: Dict[Tuple[str, str], Dict[str, Any]],
+        start: str,
+        end: str,
+    ) -> None:
+        for pair, entry in cells.items():
+            self._archive_cell_cache.set(
+                self._archive_cell_cache_key(pair, start, end),
+                entry,
+                config.HISTORICAL_WEATHER_CACHE_TTL_SEC,
+            )
+
+    def _fetch_archive_cells_uncached(
+        self,
+        pairs: List[Tuple[str, str]],
+        year: int,
+        month: int,
+        start: str,
+        end: str,
+        scope: str,
+    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Upstream request for exactly these cells, split into per-cell blocks."""
+        latitudes = [float(p[0]) for p in pairs]
+        longitudes = [float(p[1]) for p in pairs]
+        flat = self._fetch_archive_block_uncached(
+            latitudes, longitudes, year, month, start, end, scope
+        )
+        return self._cells_from_flat(pairs, flat)
 
     def _fetch_archive_block(
         self,
@@ -311,40 +486,47 @@ class HistoricalWeatherProvider:
         month: int,
         start: str,
         end: str,
+        scope: str = HISTORICAL_GRID_SCOPE,
     ) -> Dict[str, Any]:
-        """One multi-location archive request for an arbitrary start..end window.
+        """Daily archive block for an arbitrary start..end window.
 
-        Served from a bounded in-memory cache (TTL = the standard historical
-        cache TTL) with a single-flight dedupe: concurrent callers for the same
-        window + cells collapse into ONE upstream request, and every waiter
-        gets the leader's daily block (or re-raises the leader's error).
+        Cells are reused individually from the per-cell cache, so a repeated
+        grid request, a reordering of the same cells, a changed viewport, or a
+        different grid step only ever asks the upstream for the cells that are
+        genuinely missing. Concurrent callers needing the same missing cells
+        collapse into ONE upstream request via single-flight, and every waiter
+        gets the same result (or re-raises the leader's error).
+
+        `scope` selects which rate-limit cooldown slot applies, which is what
+        keeps a throttled Weather Map grid from blocking the Point Picker.
 
         Returns a dict of raw column arrays flattened per location (arrays of
-        length len(latitudes) * days); empty dict when the upstream cannot
-        serve this request."""
-        cache_key = self._archive_cache_key(latitudes, longitudes, start, end)
-        cached = self._block_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        inflight_key = f"historical:archive:{cache_key}"
-        slot, is_leader = _inflight_acquire(inflight_key)
-        if not is_leader:
-            value = _inflight_wait(slot)
-            if isinstance(value, BaseException):
-                raise value
-            return value
-
-        try:
-            value = self._fetch_archive_block_uncached(
-                latitudes, longitudes, year, month, start, end
+        length len(latitudes) * days) in the caller's order."""
+        pairs = self._cell_pairs(latitudes, longitudes)
+        cells = self._cached_archive_cells(pairs, start, end)
+        missing = [pair for pair in dict.fromkeys(pairs) if pair not in cells]
+        if missing:
+            inflight_key = (
+                f"historical:archive:{scope}:{start}:{end}:"
+                f"{self._canonical_pairs_key(missing)}"
             )
-        except BaseException as exc:
-            _inflight_done(inflight_key, slot, exc)
-            raise
-        _inflight_done(inflight_key, slot, value)
-        self._block_cache.set(cache_key, value, config.HISTORICAL_WEATHER_CACHE_TTL_SEC)
-        return value
+            slot, is_leader = _inflight_acquire(inflight_key)
+            if not is_leader:
+                fetched = _inflight_wait(slot)
+                if isinstance(fetched, BaseException):
+                    raise fetched
+            else:
+                try:
+                    fetched = self._fetch_archive_cells_uncached(
+                        missing, year, month, start, end, scope
+                    )
+                except BaseException as exc:
+                    _inflight_done(inflight_key, slot, exc)
+                    raise
+                _inflight_done(inflight_key, slot, fetched)
+            self._store_archive_cells(fetched, start, end)
+            cells.update(fetched)
+        return self._flat_from_cells(pairs, cells)
 
     def _fetch_archive_block_uncached(
         self,
@@ -354,15 +536,21 @@ class HistoricalWeatherProvider:
         month: int,
         start: str,
         end: str,
+        scope: str = HISTORICAL_GRID_SCOPE,
     ) -> Dict[str, Any]:
         """Raw archive transport for one window: bounded 429 backoff + parse.
 
-        On a 429 the provider cooldown is marked with an honoured Retry-After;
-        a short backoff is attempted up to 3 requests, and an explicit long
-        Retry-After gives up immediately instead of sleeping past our window.
+        On a 429 the cooldown for THIS scope is marked with an honoured
+        Retry-After; a short backoff is attempted up to 3 requests, and an
+        explicit long Retry-After gives up immediately instead of sleeping past
+        our window. Because the cooldown slot is per scope, a throttled grid
+        chunk does not lock out the Point Picker (and vice versa).
+
+        User-facing messages keep naming the provider, not the scope, so the
+        existing API response strings are unchanged.
         """
         provider = HISTORICAL_PROVIDER_NAME
-        if _provider_in_cooldown(provider):
+        if _provider_in_cooldown(scope):
             raise HttpFetchError(f"{provider} throttled (429 cooldown active)")
 
         params = {
@@ -391,7 +579,7 @@ class HistoricalWeatherProvider:
                 break
             headers = getattr(response, "headers", None) or {}
             retry_after = _retry_after_seconds(headers, config.HISTORICAL_WEATHER_COOLDOWN_SEC)
-            _mark_provider_cooldown(provider, retry_after)
+            _mark_provider_cooldown(scope, retry_after)
             if attempt >= 2:
                 raise HttpFetchError(f"{provider} rate limited (429)")
             delay = delayed_seconds[min(attempt, 1)]
@@ -473,10 +661,19 @@ class HistoricalWeatherProvider:
         longitudes: List[float],
         year: int,
         month: int,
+        scope: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Full completed-month daily block (arrays of len(latitudes) * days)."""
         start, end, _last_day = _month_period(year, month)
-        return self._fetch_archive_block(latitudes, longitudes, int(year), int(month), start, end)
+        return self._fetch_archive_block(
+            latitudes,
+            longitudes,
+            int(year),
+            int(month),
+            start,
+            end,
+            scope or self._default_scope,
+        )
 
     def _fetch_day_daily(
         self,
@@ -485,11 +682,20 @@ class HistoricalWeatherProvider:
         year: int,
         month: int,
         day: int,
+        scope: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Single completed-day daily block (arrays of length len(latitudes), the
         per-day grid source for the playback animation)."""
         start = end = f"{int(year)}-{int(month):02d}-{int(day):02d}"
-        return self._fetch_archive_block(latitudes, longitudes, int(year), int(month), start, end)
+        return self._fetch_archive_block(
+            latitudes,
+            longitudes,
+            int(year),
+            int(month),
+            start,
+            end,
+            scope or self._default_scope,
+        )
 
     # -------------------------------- grid ----------------------------------
 
@@ -769,7 +975,10 @@ class HistoricalWeatherProvider:
             return cached_point
 
         try:
-            daily = self._fetch_month_daily([lat], [lng], int(year), int(month))
+            # The Point Picker runs under its OWN rate-limit scope: a throttled
+            # Weather Map grid must not lock out a valid single-cell request.
+            with self._scope(HISTORICAL_POINT_SCOPE):
+                daily = self._fetch_month_daily([lat], [lng], int(year), int(month))
         except HttpFetchError as exc:
             return {
                 "latitude": lat,

@@ -1080,13 +1080,13 @@ def test_fetch_grid_partial_failure_is_historical_with_unavailable_cells(monkeyp
 
 
 def test_point_month_throttled_is_honest_unavailable(monkeypatch):
-    """While the archive provider is in 429 cooldown, the point read answers
-    UNAVAILABLE with a reason and does NOT touch the network."""
+    """While the POINT PICKER's own archive scope is in 429 cooldown, the point
+    read answers UNAVAILABLE with a reason and does NOT touch the network."""
     from app.weather_service import _mark_provider_cooldown
 
     monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
     provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
-    _mark_provider_cooldown(HISTORICAL_PROVIDER_NAME, 60.0)
+    _mark_provider_cooldown(historical_weather_mod.HISTORICAL_POINT_SCOPE, 60.0)
 
     def no_network(url, params=None, timeout=None):
         raise AssertionError("must not hit the network while in cooldown")
@@ -1094,4 +1094,289 @@ def test_point_month_throttled_is_honest_unavailable(monkeypatch):
     monkeypatch.setattr(historical_weather_mod, "http_get", no_network)
     payload = provider.fetch_point_month(30.42, 79.35, 2025, 6)
     assert payload["data_status"] == "UNAVAILABLE"
-    assert payload["reason"]
+    assert "throttled" in payload["reason"]
+
+
+# ---------------- production fix: grid/point rate-limit separation + cell reuse ----
+#
+# Regression cover for the production incident where the Weather Map grid's
+# multi-location chunks were throttled by Open-Meteo (HTTP 429) and the shared
+# process-global cooldown then locked out the Point Picker, which reported
+# "Historical archive unavailable — Open-Meteo ERA5 Archive throttled
+# (429 cooldown active)" even though its own single-cell request was valid.
+
+
+def test_grid_429_does_not_block_point_picker(monkeypatch):
+    """A throttled GRID must leave the Point Picker independently usable.
+
+    This is the exact production failure: the grid gets 429 and arms the grid
+    cooldown; the Point Picker must still return real historical data.
+    """
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    monkeypatch.setattr(historical_weather_mod.time, "sleep", lambda _: None)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+
+    grid_cells = [(30.0 + i * 0.25, 79.0 + i * 0.25) for i in range(5)]
+
+    def upstream(url, params=None, timeout=None):
+        lats = str(params["latitude"]).split(",")
+        if len(lats) > 1:
+            return FakeJsonResponse(429, None, headers={})
+        return FakeJsonResponse(200, _archive_daily_body(params))
+
+    monkeypatch.setattr(historical_weather_mod, "http_get", upstream)
+
+    # The grid is throttled -> honest UNAVAILABLE cells, grid cooldown armed.
+    grid = provider.fetch_grid(
+        31.0, 30.0, 80.0, 79.0, step=0.25, max_points=5, variable="precipitation",
+        year=2025, month=6, day=0, session=None,
+    )
+    assert grid["points"]
+    assert all(p["data_status"] == "UNAVAILABLE" for p in grid["points"])
+
+    from app.weather_service import _provider_in_cooldown
+
+    assert _provider_in_cooldown(historical_weather_mod.HISTORICAL_GRID_SCOPE)
+    assert not _provider_in_cooldown(historical_weather_mod.HISTORICAL_POINT_SCOPE)
+
+    # The Point Picker is NOT poisoned by the grid's 429.
+    point = provider.fetch_point_month(grid_cells[0][0], grid_cells[0][1], 2025, 6)
+    assert point["data_status"] == "HISTORICAL"
+    assert point["reason"] is None
+    assert point["variables"]["precipitation"]["value"] is not None
+
+
+def test_point_picker_429_does_not_arm_grid_cooldown(monkeypatch):
+    """A throttled POINT PICKER uses only its own scope; the grid is unaffected."""
+    from app.weather_service import _provider_in_cooldown
+
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    monkeypatch.setattr(historical_weather_mod.time, "sleep", lambda _: None)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+
+    def upstream(url, params=None, timeout=None):
+        lats = str(params["latitude"]).split(",")
+        if len(lats) == 1:
+            return FakeJsonResponse(429, None, headers={})
+        return FakeJsonResponse(200, _archive_daily_body(params))
+
+    monkeypatch.setattr(historical_weather_mod, "http_get", upstream)
+
+    point = provider.fetch_point_month(12.97, 77.59, 2025, 6)
+    assert point["data_status"] == "UNAVAILABLE"
+    assert "429" in point["reason"]
+
+    assert _provider_in_cooldown(historical_weather_mod.HISTORICAL_POINT_SCOPE)
+    assert not _provider_in_cooldown(historical_weather_mod.HISTORICAL_GRID_SCOPE)
+
+    # Grid still reaches the upstream archive normally.
+    grid = provider.fetch_grid(
+        31.0, 30.0, 80.0, 79.0, step=0.25, max_points=4, variable="precipitation",
+        year=2025, month=6, day=0, session=None,
+    )
+    assert grid["min"] is not None
+
+
+def test_repeated_grid_requests_reuse_cached_cells(monkeypatch):
+    """A second identical grid request is served entirely from cache."""
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+    calls = {"n": 0, "cells": []}
+
+    def intercept(url, params=None, timeout=None):
+        calls["n"] += 1
+        calls["cells"].append(len(str(params["latitude"]).split(",")))
+        return FakeJsonResponse(200, _archive_daily_body(params))
+
+    monkeypatch.setattr(historical_weather_mod, "http_get", intercept)
+
+    args = dict(
+        step=0.25, max_points=9, variable="precipitation", year=2025, month=6, day=0, session=None
+    )
+    first = provider.fetch_grid(31.0, 30.0, 80.0, 79.0, **args)
+    after_first = calls["n"]
+    second = provider.fetch_grid(31.0, 30.0, 80.0, 79.0, **args)
+
+    assert calls["n"] == after_first, "repeat grid request must not hit the upstream"
+    assert first["points"] == second["points"]
+
+
+def test_coordinate_order_does_not_invalidate_cache(monkeypatch):
+    """The same cells in a different order reuse the cached daily block."""
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+    calls = {"n": 0}
+
+    def intercept(url, params=None, timeout=None):
+        calls["n"] += 1
+        return FakeJsonResponse(200, _archive_daily_body(params))
+
+    monkeypatch.setattr(historical_weather_mod, "http_get", intercept)
+
+    lats = [30.0, 30.25, 30.5]
+    lngs = [79.0, 79.25, 79.5]
+    forward = provider._fetch_month_daily(lats, lngs, 2025, 6)
+    assert calls["n"] == 1
+
+    # Same cells, reversed request order -> served from cache, no refetch.
+    provider._fetch_month_daily(list(reversed(lats)), list(reversed(lngs)), 2025, 6)
+    assert calls["n"] == 1, "reordered cells must not re-fetch"
+
+    # Re-requesting in the original order is byte-identical (no drift).
+    assert provider._fetch_month_daily(lats, lngs, 2025, 6) == forward
+    assert calls["n"] == 1
+
+    # Positional contract preserved: asking for ONE middle cell returns exactly
+    # that cell's slice of the original multi-cell block.
+    middle = provider._fetch_month_daily([30.25], [79.25], 2025, 6)
+    assert calls["n"] == 1
+    days = len(forward["time"]) // 3
+    assert middle["temperature_2m_max"] == forward["temperature_2m_max"][days : 2 * days]
+    assert middle["time"] == forward["time"][days : 2 * days]
+
+
+def test_viewport_change_only_fetches_genuinely_new_cells(monkeypatch):
+    """Panning to an overlapping viewport reuses held cells and fetches only
+    the newly exposed ones — no full re-fetch of the whole viewport."""
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+    calls = {"cells": []}
+
+    def intercept(url, params=None, timeout=None):
+        calls["cells"].append(len(str(params["latitude"]).split(",")))
+        return FakeJsonResponse(200, _archive_daily_body(params))
+
+    monkeypatch.setattr(historical_weather_mod, "http_get", intercept)
+
+    provider._fetch_month_daily([30.0, 30.25, 30.5], [79.0, 79.25, 79.5], 2025, 6)
+    assert calls["cells"] == [3]
+
+    # Shifted viewport: (30.5,79.5) is already held, the other two are new.
+    provider._fetch_month_daily([30.5, 30.75, 31.0], [79.5, 79.75, 80.0], 2025, 6)
+    assert calls["cells"] == [3, 2], "only genuinely new cells may be requested"
+
+
+def test_point_picker_success_is_reused_from_cache(monkeypatch):
+    """A successful Point Picker response is cached and replayed, and is served
+    with zero upstream requests even while the grid scope is in cooldown."""
+    from app.weather_service import _mark_provider_cooldown
+
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+    calls = {"n": 0}
+
+    def intercept(url, params=None, timeout=None):
+        calls["n"] += 1
+        return FakeJsonResponse(200, _archive_daily_body(params))
+
+    monkeypatch.setattr(historical_weather_mod, "http_get", intercept)
+
+    first = provider.fetch_point_month(12.97, 77.59, 2025, 6)
+    assert first["data_status"] == "HISTORICAL"
+    assert calls["n"] == 1
+
+    second = provider.fetch_point_month(12.97, 77.59, 2025, 6)
+    assert calls["n"] == 1, "repeat point read must not refetch"
+    assert second["variables"] == first["variables"]
+    assert len(second["daily"]) == len(first["daily"])
+
+    # Even with the grid scope throttled, the cached point still answers.
+    _mark_provider_cooldown(historical_weather_mod.HISTORICAL_GRID_SCOPE, 60.0)
+    third = provider.fetch_point_month(12.97, 77.59, 2025, 6)
+    assert third["data_status"] == "HISTORICAL"
+    assert calls["n"] == 1
+
+
+def test_point_picker_served_from_grid_cell_cache_without_upstream(monkeypatch):
+    """A cell the grid already fetched is reused by the Point Picker.
+
+    This is the production win: on a cold process the map loads the viewport
+    first, so a subsequent point click on that viewport costs zero upstream
+    requests and cannot be throttled."""
+    monkeypatch.setattr(historical_weather_mod, "_now_utc", lambda: SEP_2026_UTC)
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+    calls = {"n": 0}
+
+    def intercept(url, params=None, timeout=None):
+        calls["n"] += 1
+        return FakeJsonResponse(200, _archive_daily_body(params))
+
+    monkeypatch.setattr(historical_weather_mod, "http_get", intercept)
+
+    provider._fetch_month_daily([12.97], [77.59], 2025, 6)
+    assert calls["n"] == 1
+
+    point = provider.fetch_point_month(12.97, 77.59, 2025, 6)
+    assert point["data_status"] == "HISTORICAL"
+    assert calls["n"] == 1, "grid-fetched cell must satisfy the point read"
+
+
+def test_archive_block_cache_serves_repeat_without_upstream_scope_key(monkeypatch):
+    """The canonical archive key is order-independent by construction."""
+    provider = historical_weather_mod.HistoricalWeatherProvider(db_cache=False)
+    key = provider._archive_cache_key([30.0, 30.25], [79.0, 79.25], "2025-06-01", "2025-06-30")
+    reordered = provider._archive_cache_key([30.25, 30.0], [79.25, 79.0], "2025-06-01", "2025-06-30")
+    assert key == reordered
+
+
+def test_existing_successful_era5_response_shape_unchanged(db_ctx, officer_headers, era5_freezer):
+    """The ERA5 success contract (fields + provenance) is byte-for-byte intact."""
+    client = db_ctx["client"]
+    res = client.get("/api/weather/12.97/77.59/historical?year=2025&month=6", headers=officer_headers)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["data_status"] == "HISTORICAL"
+    assert body["data_source"] == HISTORICAL_SOURCE
+    assert body["provider"] == HISTORICAL_PROVIDER_NAME
+    assert body["is_historical"] is True
+    assert body["dataset"]
+    assert body["period"] == "2025-06-01/2025-06-30"
+    assert body["year"] == 2025 and body["month"] == 6
+    assert body["reason"] is None
+    assert body["variables"]["precipitation"]["available"] is True
+    # Variables the archive cannot expose stay honestly unavailable.
+    assert body["variables"]["relative_humidity"]["available"] is False
+    assert len(body["daily"]) == 30
+    for key in ("latitude", "longitude", "data_status", "data_source", "provider",
+                "provider_role", "dataset", "is_historical", "year", "month",
+                "period", "variables", "top_rain_day", "daily", "computed_at", "reason"):
+        assert key in body
+
+
+def test_weather_map_grid_response_shape_unchanged(db_ctx, officer_headers, era5_freezer):
+    """The Weather Map grid contract is unchanged by the caching rework."""
+    client = db_ctx["client"]
+    res = client.get(
+        "/api/weather/grid?bounds=31,30,80,79&variable=precipitation"
+        "&year=2025&month=6&step=0.25&max_points=9",
+        headers=officer_headers,
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["is_historical"] is True
+    assert body["data_status"] in ("HISTORICAL", "PARTIAL")
+    assert body["data_source"] == HISTORICAL_SOURCE
+    assert body["year"] == 2025 and body["month"] == 6
+    assert body["steps"]["latitude"] == 0.25
+    for key in ("points", "min", "max", "bounds", "steps", "resolution",
+                "unit", "valid_time", "computed_at", "is_historical", "data_provenance"):
+        assert key in body
+    for point in body["points"]:
+        for key in ("latitude", "longitude", "value", "data_status"):
+            assert key in point
+
+
+def test_live_weather_cooldown_scope_untouched(monkeypatch):
+    """The live/current weather chain keeps its own cooldown slots — the
+    historical grid/point scopes must not collide with it."""
+    from app.weather_service import _PROVIDER_COOLDOWN_UNTIL
+
+    scopes = {
+        historical_weather_mod.HISTORICAL_GRID_SCOPE,
+        historical_weather_mod.HISTORICAL_POINT_SCOPE,
+    }
+    assert scopes.isdisjoint(set(_PROVIDER_COOLDOWN_UNTIL))
+    assert HISTORICAL_PROVIDER_NAME not in scopes
+    for scope in scopes:
+        assert scope.startswith(HISTORICAL_PROVIDER_NAME)
+        assert len(scope) > len(HISTORICAL_PROVIDER_NAME)
