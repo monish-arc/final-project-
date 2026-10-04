@@ -31,14 +31,16 @@ const LAYER_LABELS: Record<string, string> = {
   road_conditions: 'Road Conditions',
   evacuation_routes: 'Evacuation Routes',
   google_map_tiles: 'Google Map Tiles',
-  historical_data: 'Historical Rainfall',
+  historical_data: 'Historical Rainfall (imported)',
+  era5: 'ERA5 Reanalysis (historical)',
 };
 
 const DEFAULT_LAYERS: DataStatusEntry[] = [
   { layer: 'google_map_tiles', status: 'NOT_CONFIGURED', source: 'Google Maps API key not configured', updated_at: '—' },
   { layer: 'flood_forecast', status: 'NOT_CONFIGURED', source: 'No GloFAS dataset configured', updated_at: '—' },
   { layer: 'satellite_tiles', status: 'LIVE', source: 'Esri World Imagery (free, no key)', updated_at: '—' },
-  { layer: 'historical_data', status: 'NOT_CONFIGURED', source: 'India-WRIS / IMD / KSDMA (not configured)', updated_at: '—' },
+  { layer: 'historical_data', status: 'NOT_CONFIGURED', source: 'Previous-year Kerala rainfall dataset (imported) — none imported yet', updated_at: '—' },
+  { layer: 'era5', status: 'HISTORICAL', source: 'Open-Meteo ERA5 Archive (ECMWF reanalysis)', updated_at: '—' },
   { layer: 'hazard_zones', status: 'MODEL', source: 'Terrain-derived slope + rainfall modelling', updated_at: '—' },
   { layer: 'road_network', status: 'LIVE', source: 'OpenStreetMap road graph (Overpass API)', updated_at: '—' },
   { layer: 'evacuation_routes', status: 'MODEL', source: 'Route optimization over live road graph', updated_at: '—' },

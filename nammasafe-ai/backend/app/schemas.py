@@ -377,9 +377,31 @@ class DataStatusEntryResponse(BaseModel):
     spatial_resolution: Optional[str] = None
 
 
+class ProviderStatusResponse(BaseModel):
+    """Honest per-provider status for the official Historical Data sources.
+
+    Every field is optional so the response degrades gracefully and older
+    clients that only read ``DataStatusResponse.layers`` keep working unchanged.
+    """
+
+    provider: str
+    status: str
+    source: str
+    available: bool = False
+    cached: bool = False
+    last_updated: Optional[str] = None
+    period: Optional[str] = None
+    error: Optional[str] = None
+    coverage: Optional[str] = None
+
+
 class DataStatusResponse(BaseModel):
     layers: List[DataStatusEntryResponse]
     checked_at: str
+    # Additive: per-provider breakdown of the official historical sources
+    # (ERA5 / IMD / India-WRIS / KSDMA). Optional so existing consumers of
+    # `layers` are unaffected.
+    providers: Optional[List[ProviderStatusResponse]] = None
 
 
 class DataCatalogEntryResponse(BaseModel):

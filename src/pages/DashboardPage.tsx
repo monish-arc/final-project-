@@ -17,6 +17,7 @@ import {
   RainfallGridPoint,
   FloodForecastResponse,
   DataStatusEntry,
+  ProviderStatusEntry,
   BhuvanShortestPathResponse,
   RiskAlert,
   WeatherResponse,
@@ -60,6 +61,7 @@ interface DashboardPageProps {
   rainfallGrid: RainfallGridPoint[];
   floodForecast: FloodForecastResponse | null;
   dataStatus: DataStatusEntry[] | null;
+  dataProviders?: ProviderStatusEntry[] | null;
   bhuvanRoute: BhuvanShortestPathResponse | null;
   riskAlerts: RiskAlert[];
   habitationsMeta: { data_status: string; data_source: string; count: number; reason: string | null } | null;
@@ -135,6 +137,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   rainfallGrid,
   floodForecast,
   dataStatus,
+  dataProviders,
   bhuvanRoute,
   riskAlerts,
   habitationsMeta,
@@ -578,7 +581,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
             </div>
           )}
         </div>
-        <DataSourcesPanel dataStatus={dataStatus} />
+        <DataSourcesPanel dataStatus={dataStatus} providers={dataProviders} />
         <div className="bg-sm-panel border border-sm-border rounded-xl shadow p-4">
           <HistoricalBaselineCard
             availability={historicalAvailability}

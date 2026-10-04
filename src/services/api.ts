@@ -1390,12 +1390,14 @@ export const api = {
     await ensureAuthToken();
     const res = await authFetch('/api/data-status');
     if (!res.ok) {
+      // Return an empty set rather than a hand-written partial list. The
+      // consumer resolves an empty `layers` to its own documented fallback, so a
+      // fabricated 2-row payload here would silently replace the full status
+      // list instead of deferring to it.
       return {
-        layers: [
-          { layer: 'flood_forecast', status: 'NOT_CONFIGURED', source: 'No GloFAS dataset configured' },
-          { layer: 'satellite_tiles', status: 'LIVE', source: 'Esri World Imagery (free, no key)' },
-        ],
+        layers: [],
         checked_at: new Date().toISOString(),
+        providers: [],
       };
     }
     return res.json();

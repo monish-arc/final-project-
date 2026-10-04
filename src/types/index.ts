@@ -1005,9 +1005,25 @@ export interface DataStatusEntry {
   spatial_resolution?: string | null;
 }
 
+// Per-provider breakdown of the official Historical Data sources (ERA5 / IMD /
+// India-WRIS / KSDMA). Mirrors the backend ProviderStatusResponse. Optional on
+// the response so older backends that omit it still type-check.
+export interface ProviderStatusEntry {
+  provider: string;
+  status: DataLayerStatus;
+  source: string;
+  available?: boolean;
+  cached?: boolean;
+  last_updated?: string | null;
+  period?: string | null;
+  error?: string | null;
+  coverage?: string | null;
+}
+
 export interface DataStatusResponse {
   layers: DataStatusEntry[];
   checked_at: string;
+  providers?: ProviderStatusEntry[] | null;
 }
 
 export interface BasemapKey {

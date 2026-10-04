@@ -129,6 +129,53 @@ IMD_MAUSAM_BASE_URL = os.getenv("IMD_MAUSAM_BASE_URL", "")
 IMD_MAUSAM_TOKEN = os.getenv("IMD_MAUSAM_TOKEN", "")
 IMD_MAUSAM_TIMEOUT_SEC = float(os.getenv("IMD_MAUSAM_TIMEOUT_SEC", "12"))
 
+# -------------------- Official Historical Data Providers --------------------
+# These power the per-provider Historical Data status panel. Every provider is
+# config-gated and reports its *real* state: nothing here ever fabricates a
+# reading, and a provider without credentials stays NOT_CONFIGURED.
+
+# Shared cache/retry budget for the provider probes. Probes are cheap metadata
+# calls, so the TTL is short; failures are cached far more briefly so a provider
+# recovers as soon as it comes back rather than sticking as UNAVAILABLE.
+HISTORICAL_PROVIDER_CACHE_TTL_SEC = int(os.getenv("HISTORICAL_PROVIDER_CACHE_TTL_SEC", "300"))
+HISTORICAL_PROVIDER_FAILURE_CACHE_TTL_SEC = int(os.getenv("HISTORICAL_PROVIDER_FAILURE_CACHE_TTL_SEC", "60"))
+HISTORICAL_PROVIDER_MAX_RETRIES = int(os.getenv("HISTORICAL_PROVIDER_MAX_RETRIES", "2"))
+
+# IMD official API (India Meteorological Department, Ministry of Earth Sciences).
+# Reference: https://api.imd.gov.in/public/api_reference.html
+# Requires an API key tied to an api.imd.gov.in account. The transport that
+# carries the key (header name vs query parameter) is only published behind that
+# account login, so it is configurable rather than guessed.
+IMD_API_BASE_URL = os.getenv("IMD_API_BASE_URL", "https://api.imd.gov.in/api/v1")
+IMD_API_KEY = os.getenv("IMD_API_KEY", "")
+IMD_API_KEY_HEADER = os.getenv("IMD_API_KEY_HEADER", "api-key")
+IMD_API_KEY_IN = os.getenv("IMD_API_KEY_IN", "header")  # "header" | "query"
+IMD_API_KEY_PARAM = os.getenv("IMD_API_KEY_PARAM", "api_key")
+IMD_TIMEOUT_SEC = float(os.getenv("IMD_TIMEOUT_SEC", "15"))
+# Endpoint used for the reachability/auth probe. Kept small and configurable so
+# an operator can point it at whichever documented feed they actually consume.
+IMD_STATUS_PATH = os.getenv("IMD_STATUS_PATH", "/districtwarning")
+
+# India-WRIS / National Water Data Portal (Central Water Commission, Ministry of
+# Jal Shakti) — official ArcGIS REST services for rainfall, rivers, reservoirs,
+# groundwater and flood data.
+# Reference: https://arc.indiawris.gov.in/server/rest/services
+INDIAWRIS_ARCGIS_BASE_URL = os.getenv(
+    "INDIAWRIS_ARCGIS_BASE_URL",
+    "https://arc.indiawris.gov.in/server/rest/services",
+)
+INDIAWRIS_ENABLED = os.getenv("INDIAWRIS_ENABLED", "on") == "on"
+INDIAWRIS_TIMEOUT_SEC = float(os.getenv("INDIAWRIS_TIMEOUT_SEC", "20"))
+# Official service probed to prove the catalogue serves *data*, not just a
+# directory listing. Rainfall stations are the relevant layer for this platform.
+INDIAWRIS_PROBE_SERVICE = os.getenv("INDIAWRIS_PROBE_SERVICE", "NWIC/rf_station:MapServer")
+
+# Kerala State Disaster Management Authority. KSDMA publishes warnings as HTML,
+# PDF and social/app pushes and documents no machine-readable API, so there is no
+# credential to configure. The flag exists so an operator can record that the
+# source was evaluated rather than silently omitted.
+KSDMA_ENABLED = os.getenv("KSDMA_ENABLED", "on") == "on"
+
 # -------------------- Terrain (NASA Earthdata SRTM primary / Open-Meteo fallback) --------------------
 TERRAIN_CACHE_TTL_SEC = int(os.getenv("TERRAIN_CACHE_TTL_SEC", "86400"))
 # Short TTL for cached *failure* payloads (UNAVAILABLE/NOT_CONFIGURED) so a

@@ -178,8 +178,14 @@ def get_data_status() -> List[Dict[str, str]]:
     # Historical previous-year rainfall dataset (Kerala) — HISTORICAL when
     # imported, otherwise NOT_CONFIGURED. The panel uses the normalized
     # vocabulary ("NOT_CONFIGURED"), so legacy spaced values are mapped here.
+    # This layer is the *imported* previous-year dataset, NOT a live provider.
+    # Per-provider truth for ERA5 / IMD / India-WRIS / KSDMA is reported
+    # separately through app.historical_providers (the `providers` block of
+    # /api/data-status), so this row must describe only what it actually is.
     historical_status = "NOT_CONFIGURED"
-    historical_source = "India-WRIS / IMD / KSDMA (not configured)"
+    historical_source = (
+        "Previous-year Kerala rainfall dataset (imported survey/IMD records) — none imported yet"
+    )
     try:
         from app.database import SessionLocal
         from app.historical_data import availability
@@ -279,6 +285,26 @@ def get_data_status() -> List[Dict[str, str]]:
     )
     gpm_provenance = {"version": "NASA GPM IMERG", "spatial_resolution": "0.1°"} if gpm_status == "LIVE" else {}
 
+    # ERA5 historical reanalysis (Open-Meteo archive) — the one historical
+    # provider that needs no credential. Resolved from the provider registry
+    # without any network call, so this row never overstates availability.
+    era5_status_value = "HISTORICAL"
+    era5_source = "Open-Meteo ERA5 Archive (ECMWF reanalysis)"
+    era5_provenance = {}
+    try:
+        from app.historical_providers import era5_status as _era5_status
+
+        _era5 = _era5_status()
+        era5_status_value = _era5.status
+        era5_source = _era5.source
+        if _era5.status == "HISTORICAL":
+            era5_provenance = {
+                "version": "ERA5 reanalysis (ECMWF)",
+                "spatial_resolution": "0.25° hourly",
+            }
+    except Exception:  # pragma: no cover - status panel must not fail
+        pass
+
     return [
         {"layer": "road_network", "status": "LIVE", "source": "OpenStreetMap road graph (Overpass API)", "updated_at": "—"},
         {"layer": "hazard_zones", "status": "MODEL", "source": "Terrain-derived slope + rainfall modelling", "updated_at": "—"},
@@ -288,6 +314,7 @@ def get_data_status() -> List[Dict[str, str]]:
         {"layer": "google_map_tiles", "status": basemap_status, "source": basemap_source, "updated_at": "—"},
         {"layer": "satellite_tiles", "status": "LIVE", "source": "Esri World Imagery (free, no key)", "updated_at": "—"},
         {"layer": "historical_data", "status": historical_status, "source": historical_source, "updated_at": "—"},
+        {"layer": "era5", "status": era5_status_value, "source": era5_source, "updated_at": "—", **era5_provenance},
         {"layer": "road_conditions", "status": "LIVE", "source": "Field-report-derived road status", "updated_at": "—"},
         {"layer": "evacuation_routes", "status": "LIVE", "source": "Route optimization over live road graph", "updated_at": "—"},
         {"layer": "weather", "status": weather_status, "source": weather_source, "updated_at": "—", **weather_provenance},

@@ -40,6 +40,7 @@ import {
   EvacuationOriginPayload,
   FloodForecastResponse,
   DataStatusEntry,
+  ProviderStatusEntry,
   HistoricalAvailability,
   HistoricalBaseline,
   HistoricalDistrictSummary,
@@ -101,6 +102,8 @@ export default function App() {
   } | null>(null);
   const [floodForecast, setFloodForecast] = useState<FloodForecastResponse | null>(null);
   const [dataStatus, setDataStatus] = useState<DataStatusEntry[] | null>(null);
+  // Official Historical Data providers (ERA5 / IMD / India-WRIS / KSDMA).
+  const [dataProviders, setDataProviders] = useState<ProviderStatusEntry[] | null>(null);
   const [riskZones, setRiskZones] = useState<RiskZone[]>([]);
   const [bhuvanRoute, setBhuvanRoute] = useState<BhuvanShortestPathResponse | null>(null);
   const [rainfallGrid, setRainfallGrid] = useState<RainfallGridPoint[]>([]);
@@ -330,6 +333,7 @@ export default function App() {
       setDisasterEvents(eventsData.events ?? []);
       setFloodForecast(floodData);
       setDataStatus(statusData?.layers ?? null);
+      setDataProviders(statusData?.providers ?? null);
       setHistoricalAvailability(histAvail);
       setHistoricalSummaries(histSummaries);
       setRiskZones(riskZonesData);
@@ -708,7 +712,9 @@ export default function App() {
               {activeTab === 'data_sources' && (
                 <div className="space-y-3">
                   <DataSourcesPanel
-                    dataStatus={dataStatus}
+dataStatus={dataStatus}
+                  dataProviders={dataProviders}
+                    providers={dataProviders}
                     checkedAt={dataLastUpdated ? dataLastUpdated.toISOString() : null}
                   />
                 </div>

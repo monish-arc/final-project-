@@ -39,6 +39,7 @@ from app.schemas import (
     HistoricalCompareResponse,
 )
 from app.flood_forecast import get_flood_forecasts, get_data_status
+from app.historical_providers import provider_statuses as historical_provider_statuses
 from app.risk_engine import (
     calculate_hazard_score,
     calculate_vulnerability_score,
@@ -944,10 +945,21 @@ def flood_forecast(
 
 @app.get("/api/data-status", response_model=DataStatusResponse)
 def data_status(user: dict = Depends(require_permissions("map.read_public"))):
-    """Provenance + status of every map data layer (consumed by the DataSourcePanel)."""
+    """Provenance + status of every map data layer (consumed by the DataSourcePanel).
+
+    Also returns a per-provider breakdown of the official Historical Data
+    sources. The provider probes never raise, and any unexpected failure is
+    contained here so the layer status panel keeps working.
+    """
+    try:
+        providers = [p.to_dict() for p in historical_provider_statuses()]
+    except Exception:  # pragma: no cover - dashboard must not fail on provider probes
+        providers = []
+
     return {
         "layers": get_data_status(),
         "checked_at": datetime.utcnow().isoformat(),
+        "providers": providers,
     }
 
 

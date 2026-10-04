@@ -1,14 +1,25 @@
 import React from 'react';
 import { Database } from 'lucide-react';
-import { DataStatusEntry, DataLayerStatus } from '../../types';
+import { DataStatusEntry, DataLayerStatus, ProviderStatusEntry } from '../../types';
 import { DataStatusBadge } from '../DataStatusBadge';
 
 interface DataSourcesPanelProps {
   dataStatus: DataStatusEntry[] | null;
   checkedAt?: string | null;
+  /** Official Historical Data providers (ERA5 / IMD / India-WRIS / KSDMA). */
+  providers?: ProviderStatusEntry[] | null;
 }
 
-export const DataSourcesPanel: React.FC<DataSourcesPanelProps> = ({ dataStatus, checkedAt }) => {
+// Human labels for the provider ids emitted by the backend registry. Anything
+// unrecognised falls back to the raw id so a new provider is never hidden.
+const PROVIDER_LABELS: Record<string, string> = {
+  era5: 'ERA5 Reanalysis (Open-Meteo)',
+  imd: 'IMD — India Meteorological Dept',
+  indiawris: 'India-WRIS / National Water Data',
+  ksdma: 'KSDMA — Kerala SDMA',
+};
+
+export const DataSourcesPanel: React.FC<DataSourcesPanelProps> = ({ dataStatus, checkedAt, providers }) => {
   const layers = dataStatus ?? [];
   const statusOf = (l: DataStatusEntry): string => String(l.status ?? 'UNAVAILABLE');
   // Only statuses that mean "currently serving" count as live. CACHED and
@@ -20,6 +31,8 @@ export const DataSourcesPanel: React.FC<DataSourcesPanelProps> = ({ dataStatus, 
   const unavailableCount = layers.filter((l) =>
     ['UNAVAILABLE', 'ERROR', 'NOT CONFIGURED', 'NOT_CONFIGURED'].includes(statusOf(l))
   ).length;
+  // Official provider rows, shown only when the backend actually reports them.
+  const providerRows = providers ?? [];
 
   return (
     <section className="bg-sm-panel border border-sm-border rounded-xl shadow p-4">
@@ -85,6 +98,58 @@ export const DataSourcesPanel: React.FC<DataSourcesPanelProps> = ({ dataStatus, 
             );
           })}
         </ul>
+      )}
+
+      {providerRows.length > 0 && (
+        <>
+          <h4 className="mt-4 mb-2 text-[10px] font-bold uppercase tracking-wider text-sm-muted">
+            Official Historical Data Providers
+          </h4>
+          <ul className="space-y-1.5">
+            {providerRows.map((provider) => {
+              const status = String(provider.status ?? 'UNAVAILABLE') as DataLayerStatus;
+              return (
+                <li
+                  key={provider.provider}
+                  className="flex flex-wrap items-start justify-between gap-x-3 gap-y-0.5 rounded-md px-2 py-1.5 bg-sm-panel-2/60"
+                >
+                  <span className="min-w-0">
+                    <span className="block text-[11px] font-semibold text-sm-text">
+                      {PROVIDER_LABELS[provider.provider] ?? provider.provider}
+                    </span>
+                    <span className="block text-[10px] text-sm-muted truncate max-w-[320px]">
+                      {provider.source}
+                    </span>
+                    {/* The honest reason a provider is not serving. Rendered
+                        verbatim: this is the operator-facing explanation of what
+                        is missing, so it must not be summarised away. */}
+                    {provider.error ? (
+                      <span className="block text-[10px] text-amber-300/90 leading-tight">
+                        {provider.error}
+                      </span>
+                    ) : null}
+                    {provider.coverage ? (
+                      <span className="block text-[9px] text-sm-muted/70 leading-tight">
+                        {provider.coverage}
+                        {provider.period ? ` · ${provider.period}` : ''}
+                      </span>
+                    ) : null}
+                  </span>
+                  <span className="inline-flex items-center gap-2 shrink-0">
+                    {/* Raw status verbatim, matching the layer rows above. */}
+                    <span
+                      className="font-mono text-[10px] text-sm-muted border border-sm-border rounded px-1 py-0.5"
+                      title="Raw status reported by the backend"
+                    >
+                      {String(provider.status ?? 'UNAVAILABLE')}
+                    </span>
+                    <DataStatusBadge status={status} title="" />
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        </>
       )}
     </section>
   );
